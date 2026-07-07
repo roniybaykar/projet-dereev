@@ -111,7 +111,7 @@ wordcloud==1.9.6
 # API
 fastapi==0.116.1
 uvicorn==0.35.0
-pydantic==2.11.7
+
 
 # Machine Learning / NLP
 torch
