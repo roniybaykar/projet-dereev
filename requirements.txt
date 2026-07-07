@@ -107,3 +107,25 @@ webencodings==0.5.1
 websocket-client==1.9.0
 widgetsnbextension==4.0.15
 wordcloud==1.9.6
+
+# API
+fastapi==0.116.1
+uvicorn==0.35.0
+pydantic==2.11.7
+
+# Machine Learning / NLP
+torch
+transformers
+datasets
+accelerate
+sentencepiece
+tokenizers
+huggingface-hub
+safetensors
+
+# Évaluation
+scikit-learn
+
+# Gemini
+google-generativeai
+python-dotenv
