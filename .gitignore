@@ -70,3 +70,11 @@
 
 ### Modèles entrainés 
 **/models/
+
+# ===============================
+# DONNEES SENSIBLES / PATIENTS
+# ===============================
+data/raw/dereev_data_rea.csv
+data/raw/dereev_data_rea.xls
+data/raw/dereev_data_rea.xlsx
+data/processed/

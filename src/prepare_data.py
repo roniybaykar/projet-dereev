@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from src.config import RAW_XLSX,TRAIN_CV_CSV, TEST_CSV, TEXT_COL, LABEL_COL, TEST_SIZE, RANDOM_SEED
+from src.config import DATA_PROCESSED_DIR, RAW_XLSX,TRAIN_CV_CSV, TEST_CSV, TEXT_COL, LABEL_COL, TEST_SIZE, RANDOM_SEED
 from src.preprocessing import clean_text, load_abreviations
 
 def main():
@@ -43,6 +43,8 @@ def main():
     )
 
     # 8) Sauvegarde
+    os.makedirs(DATA_PROCESSED_DIR, exist_ok=True)
+
     train_cv_df.to_csv(TRAIN_CV_CSV, index=False)
     test_df.to_csv(TEST_CSV, index=False)
 

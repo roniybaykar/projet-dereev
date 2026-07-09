@@ -9,14 +9,14 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 RESSOURCES_DIR = os.path.join(BASE_DIR, "ressources")
 
 ### FICHIERS
-RAW_XLSX = os.path.join(DATA_RAW_DIR, "dereev_synthetic_data_augmented.xlsx")
+RAW_XLSX = os.path.join(DATA_RAW_DIR, "dereev_data_rea.xlsx")
 TRAIN_CV_CSV = os.path.join(DATA_PROCESSED_DIR, "train_cv.csv")
 TEST_CSV = os.path.join(DATA_PROCESSED_DIR, "test.csv")
 DICT_ABREV = os.path.join(RESSOURCES_DIR, "abreviations", "dico_global.json")
 
 ### PARAMÈTRES DATA
 TEXT_COL = "cn_notes"
-LABEL_COL = "reev_expert"
+LABEL_COL = "reev_classe"
 TEST_SIZE = 0.15
 RANDOM_SEED = 42
 K_FOLDS = 5
