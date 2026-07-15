@@ -9,7 +9,7 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 RESSOURCES_DIR = os.path.join(BASE_DIR, "ressources")
 
 ### FICHIERS
-RAW_XLSX = os.path.join(DATA_RAW_DIR, "dereev_data_rea.xlsx")
+RAW_XLSX = os.path.join(DATA_RAW_DIR, "dereev_data_1_equilibre25.xlsx")
 TRAIN_CV_CSV = os.path.join(DATA_PROCESSED_DIR, "train_cv.csv")
 TEST_CSV = os.path.join(DATA_PROCESSED_DIR, "test.csv")
 DICT_ABREV = os.path.join(RESSOURCES_DIR, "abreviations", "dico_global.json")

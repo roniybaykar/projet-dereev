@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
 from src.config import TEST_CSV, MODELS_DIR, TRAIN_CV_CSV
 from src.data_loader import get_tokenized_datasets
@@ -11,13 +11,25 @@ def compute_metrics(eval_pred):
     proba, labels = eval_pred
     predictions = np.argmax(proba, axis = 1)
 
-    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary', zero_division=0)
     acc = accuracy_score(labels, predictions)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
 
-    return {'accuracy' : acc, 'f1' : f1, 'precision' : precision, 'recall' : recall}
+    return {
+        'accuracy' : acc,
+        'f1' : f1,
+        'precision' : precision,
+        'recall' : recall,
+        'true_negative': tn,
+        'false_positive': fp,
+        'false_negative': fn,
+        'true_positive': tp,
+        'true_positive_count': int(np.sum(labels == 1)),
+        'predicted_positive_count': int(np.sum(predictions == 1)),
+    }
 
 def main():
-    BEST_FOLD = 1 
+    BEST_FOLD = 5 
     best_model_path = os.path.join(MODELS_DIR, f"fold_{BEST_FOLD}")
 
     if not os.path.exists(best_model_path):
@@ -45,6 +57,14 @@ def main():
     print(f"F1 Score  : {results['eval_f1']:.4f}")
     print(f"Recall    : {results['eval_recall']:.4f}")
     print(f"Precision : {results['eval_precision']:.4f}")
+    print("\nMatrice de confusion:")
+    print("                 Predit 0    Predit 1")
+    print(f"Vrai 0           {int(results['eval_true_negative']):>8}    {int(results['eval_false_positive']):>8}")
+    print(f"Vrai 1           {int(results['eval_false_negative']):>8}    {int(results['eval_true_positive']):>8}")
+    print(
+        f"\nVrais positifs test: {int(results['eval_true_positive_count'])} | "
+        f"Predictions positives: {int(results['eval_predicted_positive_count'])}"
+    )
     print(f"Final Loss: {results['eval_loss']:.4f}")
     print("="*40)
 

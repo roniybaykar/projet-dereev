@@ -1,18 +1,50 @@
 import os
 import numpy as np
+import torch
+from torch import nn
 from transformers import TrainingArguments, Trainer
 from src.config import TRAIN_CV_CSV, TEST_CSV, MODELS_DIR, BATCH_SIZE, EPOCHS, LEARNING_RATE, K_FOLDS, RANDOM_SEED
 from src.data_loader import get_tokenized_datasets
 from src.model import get_model
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 
 def compute_metrics(eval_pred):
     proba, labels = eval_pred
     predictions = np.argmax(proba, axis=1)
-    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary', zero_division=0)
     acc = accuracy_score(labels, predictions)
-    return {'accuracy': acc, 'f1': f1, 'precision': precision, 'recall': recall}
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall,
+        'true_negative': tn,
+        'false_positive': fp,
+        'false_negative': fn,
+        'true_positive': tp,
+        'true_positive_count': int(np.sum(labels == 1)),
+        'predicted_positive_count': int(np.sum(predictions == 1)),
+    }
+
+
+class WeightedLossTrainer(Trainer):
+    def __init__(self, class_weights, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
+        loss = loss_fct(logits, labels)
+
+        return (loss, outputs) if return_outputs else loss
+
 
 def main():
     
@@ -39,6 +71,14 @@ def main():
         train_fold_ds = train_cv_ds.select(train_idx)
         val_fold_ds = train_cv_ds.select(val_idx)
 
+        train_labels = np.array(train_fold_ds["labels"])
+        class_counts = np.bincount(train_labels, minlength=2)
+        class_weights = class_counts.sum() / (len(class_counts) * class_counts)
+        class_weights = torch.tensor(class_weights, dtype=torch.float)
+
+        print(f"Repartition train fold: classe 0 = {class_counts[0]}, classe 1 = {class_counts[1]}")
+        print(f"Poids de loss: classe 0 = {class_weights[0]:.4f}, classe 1 = {class_weights[1]:.4f}")
+
         # Modèle vierge pour chaque itération
         model = get_model()
         fold_model_dir = os.path.join(MODELS_DIR, f"fold_{fold + 1}")
@@ -57,7 +97,8 @@ def main():
             logging_steps=10,
         )
 
-        trainer = Trainer(
+        trainer = WeightedLossTrainer(
+            class_weights=class_weights,
             model=model,
             args=training_args,
             train_dataset=train_fold_ds,
@@ -71,6 +112,16 @@ def main():
         # Évaluation sur le set de validation du fold
         eval_metrics = trainer.evaluate()
         print(f"Résultats du Fold {fold + 1}: F1 = {eval_metrics['eval_f1']:.4f} | Recall = {eval_metrics['eval_recall']:.4f}")
+        print(
+            "Matrice de confusion:\n"
+            f"                 Predit 0    Predit 1\n"
+            f"Vrai 0           {int(eval_metrics['eval_true_negative']):>8}    {int(eval_metrics['eval_false_positive']):>8}\n"
+            f"Vrai 1           {int(eval_metrics['eval_false_negative']):>8}    {int(eval_metrics['eval_true_positive']):>8}"
+        )
+        print(
+            f"Vrais positifs validation: {int(eval_metrics['eval_true_positive_count'])} | "
+            f"Predictions positives: {int(eval_metrics['eval_predicted_positive_count'])}"
+        )
         fold_results.append(eval_metrics['eval_f1'])
 
         # Sauvegarde
