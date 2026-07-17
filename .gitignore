@@ -71,6 +71,7 @@
 ### Modèles entrainés 
 **/models/
 
+
 # ===============================
 # DONNEES SENSIBLES / PATIENTS
 # ===============================
@@ -86,4 +87,4 @@ data/raw/dereev_data_1_equilibre35.xlsx
 data/raw/dereev_data_1_equilibre45.xlsx
 data/raw/dereev_data_1_equilibre25.xlsx
 data/raw/dereev_data_2.xlsx
-data/ 
+data/raw/

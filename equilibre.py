@@ -23,7 +23,7 @@ FICHIER_SORTIE = (
     DOSSIER_PROJET
     / "data"
     / "raw"
-    / "dereev_data_3_equilibre45.xlsx"
+    / "dereev_data_3_deduplicated_45.xlsx"
 )
 
 COLONNE_NOTE = "cn_notes"
