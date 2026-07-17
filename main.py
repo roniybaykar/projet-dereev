@@ -1,13 +1,15 @@
 import os
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 import numpy as np
 import torch
 from torch import nn
-from transformers import TrainingArguments, Trainer
-from src.config import TRAIN_CV_CSV, TEST_CSV, MODELS_DIR, BATCH_SIZE, EPOCHS, LEARNING_RATE, K_FOLDS, RANDOM_SEED
+from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
+from src.config import TRAIN_CV_CSV, TEST_CSV, MODELS_DIR, BATCH_SIZE, EPOCHS, LEARNING_RATE, K_FOLDS, RANDOM_SEED, EARLY_STOPPING_PATIENCE, EARLY_STOPPING_THRESHOLD
 from src.data_loader import get_tokenized_datasets
 from src.model import get_model
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+  # force l'ancien CDN
 
 def compute_metrics(eval_pred):
     proba, labels = eval_pred
@@ -89,10 +91,11 @@ def main():
             per_device_train_batch_size=BATCH_SIZE,
             per_device_eval_batch_size=BATCH_SIZE,
             learning_rate=LEARNING_RATE,
-            eval_strategy="epoch",  
-            save_strategy="epoch",  
+            eval_strategy="epoch",
+            save_strategy="epoch",
             load_best_model_at_end=True,
             metric_for_best_model="f1",
+            greater_is_better=True,
             logging_dir=f'./logs/fold_{fold + 1}',
             logging_steps=10,
         )
@@ -104,6 +107,12 @@ def main():
             train_dataset=train_fold_ds,
             eval_dataset=val_fold_ds,
             compute_metrics=compute_metrics,
+            callbacks=[
+                EarlyStoppingCallback(
+                    early_stopping_patience=EARLY_STOPPING_PATIENCE,
+                    early_stopping_threshold=EARLY_STOPPING_THRESHOLD,
+                )
+            ],
         )
 
         # Entraînement

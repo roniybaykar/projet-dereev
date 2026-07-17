@@ -1,5 +1,5 @@
 from pathlib import Path
-
+from src.config import RAW_XLSX
 import pandas as pd
 
 
@@ -15,7 +15,7 @@ FICHIER_ENTREE = (
     DOSSIER_PROJET
     / "data"
     / "raw"
-    / "dereev_data_1.xlsx"
+    / RAW_XLSX
 )
 
 # Fichier Excel de sortie, créé dans data/raw
@@ -23,7 +23,7 @@ FICHIER_SORTIE = (
     DOSSIER_PROJET
     / "data"
     / "raw"
-    / "dereev_data_1_equilibre25.xlsx"
+    / "dereev_data_3_equilibre45.xlsx"
 )
 
 COLONNE_NOTE = "cn_notes"
@@ -32,8 +32,8 @@ COLONNE_LABEL = "reev_classe"
 # Répartition souhaitée :
 # 25 % de labels 1
 # 75 % de labels 0
-PROPORTION_LABEL_1 = 0.25
-PROPORTION_LABEL_0 = 0.75
+PROPORTION_LABEL_1 = 0.45
+PROPORTION_LABEL_0 = 0.55
 
 # Permet d'obtenir le même tirage aléatoire à chaque exécution
 RANDOM_STATE = 42
