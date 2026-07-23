@@ -1,5 +1,8 @@
 """Fonctions permettant de convertir les logits et de tester des seuils."""
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
@@ -180,3 +183,65 @@ def evaluate_thresholds(
     )
 
     return results, best_result
+
+
+def plot_threshold_curve(results, output_path):
+    """Trace le F1 en fonction des seuils testés et sauvegarde le graphique."""
+    thresholds = [result["threshold"] for result in results]
+    f1_scores = [result["f1"] for result in results]
+
+    if len(thresholds) == 0:
+        raise ValueError(
+            "Aucun résultat de seuil à tracer."
+        )
+
+    best_result = max(
+        results,
+        key=lambda result: (
+            result["f1"],
+            -abs(result["threshold"] - 0.5),
+        ),
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(8, 5),
+    )
+    ax.plot(
+        thresholds,
+        f1_scores,
+        marker="o",
+        linestyle="-",
+        color="tab:blue",
+        label="F1",
+    )
+    ax.axvline(
+        best_result["threshold"],
+        color="tab:red",
+        linestyle="--",
+        linewidth=1,
+        label="Meilleur seuil",
+    )
+    ax.scatter(
+        [best_result["threshold"]],
+        [best_result["f1"]],
+        color="tab:red",
+        zorder=5,
+    )
+
+    ax.set_xlabel("Seuil")
+    ax.set_ylabel("F1")
+    ax.set_title("Évolution du F1 en fonction du seuil")
+    ax.grid(True, linestyle=":", alpha=0.6)
+    ax.legend()
+
+    min_f1 = min(f1_scores)
+    max_f1 = max(f1_scores)
+    padding = max(0.02, 0.05 * (max_f1 - min_f1))
+    ax.set_ylim(min_f1 - padding, max_f1 + padding)
+    ax.set_xlim(min(thresholds), max(thresholds))
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+    return output_path

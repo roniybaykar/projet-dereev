@@ -7,6 +7,6 @@ Projet réalisé en collaboration avec l'Hôpital Foch. L'objectif est d'utilise
 ### Environnement virtuel et dépendances
 ```
 python -m venv venv 
-.\venv\Scripts\activate
+.\venv\Scripts\activate ou source venv/bin/activate
 pip install -r requirements.txt
 ```

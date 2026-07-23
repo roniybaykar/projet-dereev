@@ -1,19 +1,39 @@
 import json
 import os
+import random
+import sys
 
+# Permet de retrouver le package "src" même si le fichier est lancé
+# depuis un environnement où la racine du projet n'est pas déjà dans sys.path.
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Variables définies avant l'import de PyTorch.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import numpy as np
+import torch
+from sklearn.metrics import log_loss
 from transformers import (
     AutoModelForSequenceClassification,
     Trainer,
+    set_seed,
 )
 
 from src.config import (
+    K_FOLDS,
     MODELS_DIR,
+    RANDOM_SEED,
     TEST_CSV,
     TRAIN_CV_CSV,
 )
-from src.data_loader import (
-    get_tokenized_datasets,
-)
+from src.data_loader import get_tokenized_datasets
 from src.threshold_metrics import (
     compute_threshold_metrics,
     logits_to_positive_probabilities,
@@ -28,43 +48,47 @@ DECISION_THRESHOLD_PATH = os.path.join(
 )
 
 
-def print_metrics_block(
-    title,
-    metrics,
-):
+def configure_determinism(seed: int) -> None:
+    """Configure autant que possible une prédiction reproductible."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    set_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+
+    try:
+        torch.use_deterministic_algorithms(
+            True,
+            warn_only=True,
+        )
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def print_metrics_block(title, metrics):
     print(f"\n{title}")
     print("-" * len(title))
 
-    print(
-        f"Seuil     : "
-        f"{metrics['threshold']:.3f}"
-    )
-
-    print(
-        f"Accuracy  : "
-        f"{metrics['accuracy']:.4f}"
-    )
-
-    print(
-        f"F1        : "
-        f"{metrics['f1']:.4f}"
-    )
-
-    print(
-        f"Recall    : "
-        f"{metrics['recall']:.4f}"
-    )
-
-    print(
-        f"Précision : "
-        f"{metrics['precision']:.4f}"
-    )
+    print(f"Seuil     : {metrics['threshold']:.3f}")
+    print(f"Accuracy  : {metrics['accuracy']:.4f}")
+    print(f"F1        : {metrics['f1']:.4f}")
+    print(f"Recall    : {metrics['recall']:.4f}")
+    print(f"Précision : {metrics['precision']:.4f}")
 
     print("\nMatrice de confusion :")
-    print(
-        "                 "
-        "Prédit 0    Prédit 1"
-    )
+    print("                 Prédit 0    Prédit 1")
 
     print(
         f"Vrai 0           "
@@ -87,84 +111,77 @@ def print_metrics_block(
 
 
 def load_optimized_threshold():
-    if not os.path.exists(
-        DECISION_THRESHOLD_PATH
-    ):
-        raise FileNotFoundError(
-            "Seuil optimisé introuvable. "
-            "Lancez main.py avant evaluate.py : "
-            f"{DECISION_THRESHOLD_PATH}"
-        )
+    """
+    Charge le seuil calculé sur les prédictions out-of-fold.
 
-    with open(
-        DECISION_THRESHOLD_PATH,
-        "r",
-        encoding="utf-8",
-    ) as file:
-        threshold_summary = json.load(
-            file
-        )
-
-    threshold = float(
-        threshold_summary[
-            "best_threshold"
-        ]
-    )
-
-    return (
-        threshold,
-        threshold_summary,
-    )
-
-
-def main():
-    best_fold = 4
-
-    best_model_path = os.path.join(
-        MODELS_DIR,
-        f"fold_{best_fold}",
-    )
-
-    if not os.path.exists(
-        best_model_path
-    ):
+    Si le fichier n'existe pas ou est invalide, le seuil 0.5 est utilisé.
+    """
+    if not os.path.exists(DECISION_THRESHOLD_PATH):
         print(
-            f"Modèle introuvable : "
-            f"{best_model_path}"
+            "Aucun seuil optimisé trouvé. "
+            "Le seuil 0.5 sera utilisé."
         )
-        print(
-            "Lancez main.py avant "
-            "evaluate.py."
-        )
-        return
+
+        return DEFAULT_DECISION_THRESHOLD
 
     try:
-        (
-            optimized_threshold,
-            threshold_summary,
-        ) = load_optimized_threshold()
+        with open(
+            DECISION_THRESHOLD_PATH,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            threshold_summary = json.load(file)
+
+        return float(
+            threshold_summary["best_threshold"]
+        )
 
     except (
-        FileNotFoundError,
+        OSError,
         KeyError,
+        TypeError,
         ValueError,
         json.JSONDecodeError,
     ) as error:
         print(
-            "Impossible de charger "
-            f"le seuil optimisé : {error}"
+            "Seuil optimisé inutilisable "
+            f"({error}). Le seuil 0.5 sera utilisé."
         )
-        return
 
-    print("\n" + "=" * 60)
-    print(
-        " ÉVALUATION FINALE SUR TEST.CSV"
+        return DEFAULT_DECISION_THRESHOLD
+
+
+def main():
+    configure_determinism(RANDOM_SEED)
+
+    if not os.path.exists(TRAIN_CV_CSV):
+        raise FileNotFoundError(
+            f"Fichier introuvable : {TRAIN_CV_CSV}"
+        )
+
+    if not os.path.exists(TEST_CSV):
+        raise FileNotFoundError(
+            f"Fichier introuvable : {TEST_CSV}"
+        )
+
+    # On réutilise exactement la même tokenisation que pendant l'entraînement.
+    _, test_ds = get_tokenized_datasets(
+        TRAIN_CV_CSV,
+        TEST_CSV,
     )
-    print("=" * 60)
+
+    optimized_threshold = load_optimized_threshold()
+
+    print("\n" + "=" * 70)
+    print(
+        " ÉVALUATION FINALE PAR ENSEMBLE "
+        f"DES {K_FOLDS} FOLDS"
+    )
+    print("=" * 70)
 
     print(
-        f"Modèle utilisé : "
-        f"fold_{best_fold}"
+        "Chaque modèle prédit le même jeu de test. "
+        "Les probabilités de classe 1 sont ensuite moyennées."
     )
 
     print(
@@ -172,86 +189,123 @@ def main():
         f"{optimized_threshold:.3f}"
     )
 
+    all_fold_probabilities = []
+    test_labels = None
+
+    for fold_index in range(1, K_FOLDS + 1):
+        fold_model_path = os.path.join(
+            MODELS_DIR,
+            f"fold_{fold_index}",
+        )
+
+        if not os.path.isdir(fold_model_path):
+            raise FileNotFoundError(
+                "Modèle de fold introuvable : "
+                f"{fold_model_path}"
+            )
+
+        print(
+            f"\nPrédiction avec fold_{fold_index}..."
+        )
+
+        model = (
+            AutoModelForSequenceClassification
+            .from_pretrained(
+                fold_model_path
+            )
+        )
+
+        # Aucun TrainingArguments n'est nécessaire pour une simple prédiction.
+        # Cela évite aussi les incompatibilités entre versions de transformers.
+        trainer = Trainer(model=model)
+
+        prediction_output = trainer.predict(
+            test_ds
+        )
+
+        fold_probabilities = (
+            logits_to_positive_probabilities(
+                prediction_output.predictions
+            )
+        )
+
+        current_labels = np.asarray(
+            prediction_output.label_ids,
+            dtype=int,
+        )
+
+        if test_labels is None:
+            test_labels = current_labels
+
+        elif not np.array_equal(
+            test_labels,
+            current_labels,
+        ):
+            raise RuntimeError(
+                "Les labels du test diffèrent "
+                "entre les prédictions des folds."
+            )
+
+        all_fold_probabilities.append(
+            fold_probabilities
+        )
+
+        # Libération de la mémoire avant de charger le fold suivant.
+        del trainer
+        del model
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    probability_matrix = np.stack(
+        all_fold_probabilities,
+        axis=0,
+    )
+
+    ensemble_probabilities = np.mean(
+        probability_matrix,
+        axis=0,
+    )
+
+    default_metrics = compute_threshold_metrics(
+        labels=test_labels,
+        probabilities=ensemble_probabilities,
+        threshold=DEFAULT_DECISION_THRESHOLD,
+    )
+
+    optimized_metrics = compute_threshold_metrics(
+        labels=test_labels,
+        probabilities=ensemble_probabilities,
+        threshold=optimized_threshold,
+    )
+
+    print("\n" + "=" * 70)
     print(
-        "Le seuil a été choisi uniquement "
-        "sur les validations out-of-fold."
+        f" RÉSULTATS DE L'ENSEMBLE DES {K_FOLDS} FOLDS"
     )
-
-    print(
-        "Le test final n'a pas participé "
-        "au choix du seuil."
-    )
-
-    _, test_ds = (
-        get_tokenized_datasets(
-            TRAIN_CV_CSV,
-            TEST_CSV,
-        )
-    )
-
-    model = (
-        AutoModelForSequenceClassification
-        .from_pretrained(
-            best_model_path
-        )
-    )
-
-    trainer = Trainer(
-        model=model
-    )
-
-    prediction_output = trainer.predict(
-        test_ds
-    )
-
-    test_probabilities = (
-        logits_to_positive_probabilities(
-            prediction_output.predictions
-        )
-    )
-
-    test_labels = (
-        prediction_output.label_ids
-    )
-
-    default_metrics = (
-        compute_threshold_metrics(
-            labels=test_labels,
-            probabilities=(
-                test_probabilities
-            ),
-            threshold=(
-                DEFAULT_DECISION_THRESHOLD
-            ),
-        )
-    )
-
-    optimized_metrics = (
-        compute_threshold_metrics(
-            labels=test_labels,
-            probabilities=(
-                test_probabilities
-            ),
-            threshold=(
-                optimized_threshold
-            ),
-        )
-    )
+    print("=" * 70)
 
     print_metrics_block(
-        title=(
-            "RÉSULTATS AVEC "
-            "LE SEUIL STANDARD"
-        ),
+        title="ENSEMBLE AVEC LE SEUIL STANDARD",
         metrics=default_metrics,
     )
 
     print_metrics_block(
-        title=(
-            "RÉSULTATS AVEC "
-            "LE SEUIL OPTIMISÉ"
-        ),
+        title="ENSEMBLE AVEC LE SEUIL OPTIMISÉ OOF",
         metrics=optimized_metrics,
+    )
+
+    probabilities_for_log_loss = np.column_stack(
+        [
+            1.0 - ensemble_probabilities,
+            ensemble_probabilities,
+        ]
+    )
+
+    ensemble_log_loss = log_loss(
+        test_labels,
+        probabilities_for_log_loss,
+        labels=[0, 1],
     )
 
     print("\nCOMPARAISON")
@@ -272,17 +326,25 @@ def main():
         f"{optimized_metrics['recall'] - default_metrics['recall']:+.4f}"
     )
 
-    test_loss = (
-        prediction_output.metrics.get(
-            "test_loss"
+    print(
+        f"Log loss ensemble   : "
+        f"{ensemble_log_loss:.4f}"
+    )
+
+    mean_fold_disagreement = float(
+        np.mean(
+            np.std(
+                probability_matrix,
+                axis=0,
+            )
         )
     )
 
-    if test_loss is not None:
-        print(
-            f"Loss finale         : "
-            f"{test_loss:.4f}"
-        )
+    print(
+        "Écart moyen entre les folds "
+        "sur la probabilité de classe 1 : "
+        f"{mean_fold_disagreement:.4f}"
+    )
 
 
 if __name__ == "__main__":

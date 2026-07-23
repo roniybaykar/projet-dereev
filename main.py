@@ -1,33 +1,67 @@
-import os
-
-from webencodings import labels
-os.environ["HF_HUB_DISABLE_XET"] = "1"
+import inspect
 import json
-import pandas as pd
+import os
+import random
+import shutil
+import sys
+
+# Re-lance automatiquement Python une seule fois avec PYTHONHASHSEED fixé.
+# L'utilisateur peut donc simplement exécuter : python3 -m main
+_DEFAULT_HASH_SEED = "42"
+if os.environ.get("PYTHONHASHSEED") != _DEFAULT_HASH_SEED:
+    environment = os.environ.copy()
+    environment["PYTHONHASHSEED"] = _DEFAULT_HASH_SEED
+    os.execve(
+        sys.executable,
+        [sys.executable, *sys.argv],
+        environment,
+    )
+
+# Doit être défini avant l'import de torch et avant l'initialisation de CUDA.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
-from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
-from src.config import TRAIN_CV_CSV, TEST_CSV, MODELS_DIR, BATCH_SIZE, EPOCHS, LEARNING_RATE, K_FOLDS, RANDOM_SEED, EARLY_STOPPING_PATIENCE, EARLY_STOPPING_THRESHOLD
+from sklearn.model_selection import StratifiedKFold
+from transformers import (
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
+
+from src.config import (
+    BATCH_SIZE,
+    EARLY_STOPPING_PATIENCE,
+    EARLY_STOPPING_THRESHOLD,
+    EPOCHS,
+    K_FOLDS,
+    LEARNING_RATE,
+    MODELS_DIR,
+    RANDOM_SEED,
+    TEST_CSV,
+    TRAIN_CV_CSV,
+)
 from src.data_loader import get_tokenized_datasets
 from src.model import get_model
-from sklearn.model_selection import StratifiedKFold
-
 from src.threshold_metrics import (
     compute_threshold_metrics,
     evaluate_thresholds,
     logits_to_positive_probabilities,
+    plot_threshold_curve,
 )
 
-# Seuil standard utilisé pendant l'entraînement.
+
 DEFAULT_DECISION_THRESHOLD = 0.5
 
-# Seuils qui seront testés après les cinq folds.
 THRESHOLD_MIN = 0.05
 THRESHOLD_MAX = 0.95
 THRESHOLD_STEP = 0.01
 
-# Fichiers produits après la recherche du meilleur seuil.
 DECISION_THRESHOLD_PATH = os.path.join(
     MODELS_DIR,
     "decision_threshold.json",
@@ -38,18 +72,120 @@ THRESHOLD_RESULTS_PATH = os.path.join(
     "threshold_results.csv",
 )
 
+THRESHOLD_PLOT_PATH = os.path.join(
+    MODELS_DIR,
+    "threshold_results.png",
+)
+
 OOF_PREDICTIONS_PATH = os.path.join(
     MODELS_DIR,
     "oof_predictions.csv",
 )
 
+EXPERIMENT_SUMMARY_PATH = os.path.join(
+    MODELS_DIR,
+    "experiment_summary.json",
+)
+
+
+def configure_determinism(seed: int) -> None:
+    """
+    Fixe toutes les graines accessibles afin que deux exécutions
+    sur la même machine et avec les mêmes versions soient reproductibles.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    set_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+
+    # Force autant que possible des algorithmes déterministes.
+    if hasattr(torch, "use_deterministic_algorithms"):
+        torch.use_deterministic_algorithms(
+            True,
+            warn_only=True,
+        )
+
+
+def build_training_arguments(
+    fold_model_dir: str,
+    fold_index: int,
+    fold_seed: int,
+):
+    """Construit des TrainingArguments compatibles avec la version installée."""
+    parameters = inspect.signature(
+        TrainingArguments.__init__
+    ).parameters
+
+    arguments = {
+        "output_dir": fold_model_dir,
+        "num_train_epochs": EPOCHS,
+        "per_device_train_batch_size": BATCH_SIZE,
+        "per_device_eval_batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "save_strategy": "epoch",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "f1",
+        "greater_is_better": True,
+        "save_total_limit": 1,
+        "seed": fold_seed,
+        "data_seed": fold_seed,
+        "full_determinism": True,
+        "dataloader_num_workers": 0,
+        "logging_dir": os.path.join(
+            "logs",
+            f"fold_{fold_index}",
+        ),
+        "logging_steps": 10,
+        "report_to": "none",
+    }
+
+    if "eval_strategy" in parameters:
+        arguments["eval_strategy"] = "epoch"
+    elif "evaluation_strategy" in parameters:
+        arguments["evaluation_strategy"] = "epoch"
+    else:
+        raise RuntimeError(
+            "Votre version de transformers ne propose ni "
+            "eval_strategy ni evaluation_strategy."
+        )
+
+    unsupported_arguments = [
+        name for name in arguments if name not in parameters
+    ]
+
+    for name in unsupported_arguments:
+        arguments.pop(name)
+
+    if unsupported_arguments:
+        print(
+            "Arguments ignorés car non pris en charge par "
+            "votre version de transformers : "
+            + ", ".join(unsupported_arguments)
+        )
+
+    return TrainingArguments(**arguments)
+
+
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
 
-    probabilities = (
-        logits_to_positive_probabilities(
-            logits
-        )
+    probabilities = logits_to_positive_probabilities(
+        logits
     )
 
     return compute_threshold_metrics(
@@ -58,50 +194,24 @@ def compute_metrics(eval_pred):
         threshold=DEFAULT_DECISION_THRESHOLD,
     )
 
-def print_metrics_block(
-    title,
-    metrics,
-):
+
+def print_metrics_block(title, metrics):
     print(f"\n{title}")
     print("-" * len(title))
 
-    print(
-        f"Seuil     : "
-        f"{metrics['threshold']:.3f}"
-    )
-
-    print(
-        f"F1        : "
-        f"{metrics['f1']:.4f}"
-    )
-
-    print(
-        f"Précision : "
-        f"{metrics['precision']:.4f}"
-    )
-
-    print(
-        f"Recall    : "
-        f"{metrics['recall']:.4f}"
-    )
-
-    print(
-        f"Accuracy  : "
-        f"{metrics['accuracy']:.4f}"
-    )
+    print(f"Seuil     : {metrics['threshold']:.3f}")
+    print(f"F1        : {metrics['f1']:.4f}")
+    print(f"Précision : {metrics['precision']:.4f}")
+    print(f"Recall    : {metrics['recall']:.4f}")
+    print(f"Accuracy  : {metrics['accuracy']:.4f}")
 
     print("\nMatrice de confusion :")
-    print(
-        "                 "
-        "Prédit 0    Prédit 1"
-    )
-
+    print("                 Prédit 0    Prédit 1")
     print(
         f"Vrai 0           "
         f"{metrics['true_negative']:>8}    "
         f"{metrics['false_positive']:>8}"
     )
-
     print(
         f"Vrai 1           "
         f"{metrics['false_negative']:>8}    "
@@ -115,114 +225,234 @@ def print_metrics_block(
         f"{metrics['predicted_positive_count']}"
     )
 
+
 class WeightedLossTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        **kwargs,
+    ):
         labels = inputs.pop("labels")
+
         outputs = model(**inputs)
         logits = outputs.logits
 
-        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
-        loss = loss_fct(logits, labels)
+        loss_function = nn.CrossEntropyLoss(
+            weight=self.class_weights.to(logits.device)
+        )
 
-        return (loss, outputs) if return_outputs else loss
+        loss = loss_function(
+            logits,
+            labels,
+        )
+
+        if return_outputs:
+            return loss, outputs
+
+        return loss
+
+
+def remove_previous_outputs() -> None:
+    """
+    Supprime les résultats globaux de l'expérience précédente.
+    Les dossiers fold_X sont supprimés séparément avant chaque fold.
+    """
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    output_files = [
+        DECISION_THRESHOLD_PATH,
+        THRESHOLD_RESULTS_PATH,
+        OOF_PREDICTIONS_PATH,
+        EXPERIMENT_SUMMARY_PATH,
+    ]
+
+    for path in output_files:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def main():
-    
-    # 1. vérification des données
-    if not os.path.exists(TRAIN_CV_CSV) or not os.path.exists(TEST_CSV):
-        print("fichiers introuvables dans data/processed, il faut d'abord preprocess le dataset")
+    configure_determinism(RANDOM_SEED)
+    remove_previous_outputs()
+
+    if not os.path.exists(TRAIN_CV_CSV):
+        print(f"Fichier introuvable : {TRAIN_CV_CSV}")
+        print("Lancez d'abord le preprocessing.")
         return
 
-    # 2. tokenization
-    train_cv_ds, test_ds = get_tokenized_datasets(TRAIN_CV_CSV, TEST_CSV)
+    if not os.path.exists(TEST_CSV):
+        print(f"Fichier introuvable : {TEST_CSV}")
+        print("Lancez d'abord le preprocessing.")
+        return
 
-    # 3. Préparation du K-Fold
-    labels = np.array(train_cv_ds["labels"]) 
-    skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    train_cv_ds, _ = get_tokenized_datasets(
+        TRAIN_CV_CSV,
+        TEST_CSV,
+    )
+
+    labels = np.asarray(
+        train_cv_ds["labels"],
+        dtype=int,
+    )
+
+    skf = StratifiedKFold(
+        n_splits=K_FOLDS,
+        shuffle=True,
+        random_state=RANDOM_SEED,
+    )
 
     fold_results = []
-    
-    # Une probabilité sera stockée pour chaque observation.
+    fold_summaries = []
+
     oof_probabilities = np.full(
-    len(labels),
-    np.nan,
-    dtype=float,
+        len(labels),
+        np.nan,
+        dtype=float,
     )
 
-    # Fold ayant produit la probabilité de chaque observation.
     oof_folds = np.full(
-    len(labels),
-    -1,
-    dtype=int,
+        len(labels),
+        -1,
+        dtype=int,
     )
 
-    
+    split_iterator = skf.split(
+        np.zeros(len(labels)),
+        labels,
+    )
 
-    # 4. Boucle d'entraînement croisé
-    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
-        print(f"\n{'='*40}")
-        print(f" DÉMARRAGE DU FOLD {fold + 1}/{K_FOLDS}")
-        print(f"{'='*40}")
+    for fold_index, (train_idx, val_idx) in enumerate(
+        split_iterator,
+        start=1,
+    ):
+        # Une graine déterministe différente par fold.
+        # Elle reste identique entre deux exécutions.
+        fold_seed = RANDOM_SEED + fold_index
+        configure_determinism(fold_seed)
 
-        train_fold_ds = train_cv_ds.select(train_idx)
-        val_fold_ds = train_cv_ds.select(val_idx)
+        print("\n" + "=" * 50)
+        print(
+            f" DÉMARRAGE DU FOLD "
+            f"{fold_index}/{K_FOLDS}"
+        )
+        print(f" Graine du fold : {fold_seed}")
+        print("=" * 50)
 
-        train_labels = np.array(train_fold_ds["labels"])
-        class_counts = np.bincount(train_labels, minlength=2)
-        class_weights = class_counts.sum() / (len(class_counts) * class_counts)
-        class_weights = torch.tensor(class_weights, dtype=torch.float)
+        train_fold_ds = train_cv_ds.select(
+            train_idx
+        )
 
-        print(f"Repartition train fold: classe 0 = {class_counts[0]}, classe 1 = {class_counts[1]}")
-        print(f"Poids de loss: classe 0 = {class_weights[0]:.4f}, classe 1 = {class_weights[1]:.4f}")
+        val_fold_ds = train_cv_ds.select(
+            val_idx
+        )
 
-        # Modèle vierge pour chaque itération
-        model = get_model()
-        fold_model_dir = os.path.join(MODELS_DIR, f"fold_{fold + 1}")
+        train_labels = np.asarray(
+            train_fold_ds["labels"],
+            dtype=int,
+        )
 
-        training_args = TrainingArguments(
-            output_dir=fold_model_dir,
-            num_train_epochs=EPOCHS,
-            per_device_train_batch_size=BATCH_SIZE,
-            per_device_eval_batch_size=BATCH_SIZE,
-            learning_rate=LEARNING_RATE,
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            metric_for_best_model="f1",
-            greater_is_better=True,
-            logging_dir=f'./logs/fold_{fold + 1}',
-            logging_steps=10,
+        class_counts = np.bincount(
+            train_labels,
+            minlength=2,
+        )
+
+        if np.any(class_counts == 0):
+            raise RuntimeError(
+                "Une classe est absente du fold "
+                f"{fold_index}."
+            )
+
+        class_weights = (
+            class_counts.sum()
+            / (
+                len(class_counts)
+                * class_counts
+            )
+        )
+
+        class_weights = torch.tensor(
+            class_weights,
+            dtype=torch.float32,
+        )
+
+        print(
+            "Répartition train fold : "
+            f"classe 0 = {class_counts[0]}, "
+            f"classe 1 = {class_counts[1]}"
+        )
+
+        print(
+            "Poids de loss : "
+            f"classe 0 = {class_weights[0]:.4f}, "
+            f"classe 1 = {class_weights[1]:.4f}"
+        )
+
+        fold_model_dir = os.path.join(
+            MODELS_DIR,
+            f"fold_{fold_index}",
+        )
+
+        # Évite de mélanger de vieux checkpoints
+        # avec le nouvel entraînement.
+        if os.path.exists(fold_model_dir):
+            shutil.rmtree(fold_model_dir)
+
+        training_args = build_training_arguments(
+            fold_model_dir=fold_model_dir,
+            fold_index=fold_index,
+            fold_seed=fold_seed,
         )
 
         trainer = WeightedLossTrainer(
             class_weights=class_weights,
-            model=model,
+
+            # Important :
+            # le Trainer crée le modèle après avoir fixé sa graine.
+            model_init=get_model,
+
             args=training_args,
             train_dataset=train_fold_ds,
             eval_dataset=val_fold_ds,
             compute_metrics=compute_metrics,
             callbacks=[
                 EarlyStoppingCallback(
-                    early_stopping_patience=EARLY_STOPPING_PATIENCE,
-                    early_stopping_threshold=EARLY_STOPPING_THRESHOLD,
+                    early_stopping_patience=(
+                        EARLY_STOPPING_PATIENCE
+                    ),
+                    early_stopping_threshold=(
+                        EARLY_STOPPING_THRESHOLD
+                    ),
                 )
             ],
         )
 
-        # Entraînement
         trainer.train()
 
-        # Le meilleur modèle du fold prédit sa validation.
+        print(
+            "\nMeilleur checkpoint : "
+            f"{trainer.state.best_model_checkpoint}"
+        )
+
+        print(
+            "Meilleur F1 de validation : "
+            f"{trainer.state.best_metric}"
+        )
+
+        print(
+            "Epoch finale : "
+            f"{trainer.state.epoch}"
+        )
+
         prediction_output = trainer.predict(
             val_fold_ds
         )
 
-        # Trainer renvoie des logits et non des probabilités.
         validation_probabilities = (
             logits_to_positive_probabilities(
                 prediction_output.predictions
@@ -234,17 +464,12 @@ def main():
             dtype=int,
         )
 
-        # Stockage à la position originale des observations.
-        #
-        # Chaque probabilité est produite par un modèle
-        # qui n'a jamais entraîné l'observation correspondante.
         oof_probabilities[val_idx] = (
             validation_probabilities
         )
 
-        oof_folds[val_idx] = fold + 1
+        oof_folds[val_idx] = fold_index
 
-        # Affichage du résultat du fold au seuil standard.
         fold_metrics = compute_threshold_metrics(
             labels=validation_labels,
             probabilities=validation_probabilities,
@@ -254,7 +479,7 @@ def main():
         print_metrics_block(
             title=(
                 f"RÉSULTATS DU FOLD "
-                f"{fold + 1} AU SEUIL 0.5"
+                f"{fold_index} AU SEUIL 0.5"
             ),
             metrics=fold_metrics,
         )
@@ -263,33 +488,65 @@ def main():
             fold_metrics["f1"]
         )
 
-        # Sauvegarde
-        trainer.save_model(fold_model_dir)
+        fold_summaries.append({
+            "fold": fold_index,
+            "seed": fold_seed,
+            "best_checkpoint": (
+                trainer.state.best_model_checkpoint
+            ),
+            "best_validation_metric": (
+                trainer.state.best_metric
+            ),
+            "final_epoch": trainer.state.epoch,
+            "validation_metrics": fold_metrics,
+        })
 
-    print("\n" + "="*40)
+        # Le meilleur checkpoint a déjà été rechargé
+        # grâce à load_best_model_at_end=True.
+        trainer.save_model(
+            fold_model_dir
+        )
+
+    print("\n" + "=" * 50)
     print(" BILAN DE LA CROSS-VALIDATION")
-    print("="*40)
-    print(f"Scores F1 par fold : {[round(score, 4) for score in fold_results]}")
-    print(f"F1 Moyen : {np.mean(fold_results):.4f} (+/- {np.std(fold_results):.4f})")
-        # Vérification : chaque observation doit avoir été
-    # placée une fois en validation.
-    if np.isnan(
-        oof_probabilities
-    ).any():
+    print("=" * 50)
+
+    rounded_scores = [
+        round(score, 4)
+        for score in fold_results
+    ]
+
+    mean_f1 = float(
+        np.mean(fold_results)
+    )
+
+    std_f1 = float(
+        np.std(fold_results)
+    )
+
+    print(
+        f"Scores F1 par fold : "
+        f"{rounded_scores}"
+    )
+
+    print(
+        f"F1 moyen : "
+        f"{mean_f1:.4f} "
+        f"(+/- {std_f1:.4f})"
+    )
+
+    if np.isnan(oof_probabilities).any():
         raise RuntimeError(
             "Certaines observations n'ont pas reçu "
             "de probabilité out-of-fold."
         )
 
-    if np.any(
-        oof_folds == -1
-    ):
+    if np.any(oof_folds == -1):
         raise RuntimeError(
             "Certaines observations ne sont associées "
             "à aucun fold."
         )
 
-    # Recherche du seuil maximisant le F1.
     threshold_results, best_result = (
         evaluate_thresholds(
             labels=labels,
@@ -300,23 +557,12 @@ def main():
         )
     )
 
-    # Résultat de référence avec le seuil 0.5.
-    default_result = (
-        compute_threshold_metrics(
-            labels=labels,
-            probabilities=oof_probabilities,
-            threshold=(
-                DEFAULT_DECISION_THRESHOLD
-            ),
-        )
+    default_result = compute_threshold_metrics(
+        labels=labels,
+        probabilities=oof_probabilities,
+        threshold=DEFAULT_DECISION_THRESHOLD,
     )
 
-    os.makedirs(
-        MODELS_DIR,
-        exist_ok=True,
-    )
-
-    # Sauvegarde des résultats de tous les seuils.
     pd.DataFrame(
         threshold_results
     ).to_csv(
@@ -324,7 +570,6 @@ def main():
         index=False,
     )
 
-    # Sauvegarde des probabilités out-of-fold.
     pd.DataFrame({
         "row_index": np.arange(
             len(labels)
@@ -339,7 +584,6 @@ def main():
         index=False,
     )
 
-    # Résumé du seuil retenu.
     threshold_summary = {
         "selection_data": (
             "out_of_fold_validation"
@@ -367,6 +611,27 @@ def main():
             ensure_ascii=False,
         )
 
+    experiment_summary = {
+        "random_seed": RANDOM_SEED,
+        "k_folds": K_FOLDS,
+        "fold_f1_scores": fold_results,
+        "mean_f1": mean_f1,
+        "std_f1": std_f1,
+        "folds": fold_summaries,
+    }
+
+    with open(
+        EXPERIMENT_SUMMARY_PATH,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            experiment_summary,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
     print("\n" + "=" * 60)
     print(
         " OPTIMISATION DU SEUIL SUR "
@@ -376,8 +641,8 @@ def main():
 
     print(
         "Le test final n'est pas utilisé ici. "
-        "Chaque probabilité provient d'un modèle "
-        "qui n'a pas entraîné l'observation."
+        "Chaque observation est prédite par le fold "
+        "qui ne l'a pas vue pendant l'entraînement."
     )
 
     print_metrics_block(
@@ -386,9 +651,7 @@ def main():
     )
 
     print_metrics_block(
-        title=(
-            "MEILLEUR SEUIL POUR LE F1"
-        ),
+        title="MEILLEUR SEUIL POUR LE F1",
         metrics=best_result,
     )
 
@@ -398,11 +661,10 @@ def main():
     )
 
     print(
-        f"\nGain de F1 par rapport "
+        "\nGain de F1 par rapport "
         f"au seuil 0.5 : {f1_gain:+.4f}"
     )
 
-    # Afficher les dix meilleurs seuils.
     top_results = sorted(
         threshold_results,
         key=lambda result: result["f1"],
@@ -410,12 +672,10 @@ def main():
     )[:10]
 
     print("\nTop 10 des seuils testés :")
-
     print(
         " Seuil |    F1 | Précision | "
         "Recall |  FP |  FN"
     )
-
     print("-" * 55)
 
     for result in top_results:
@@ -428,21 +688,43 @@ def main():
             f"{result['false_negative']:>3}"
         )
 
+    plot_threshold_curve(
+        results=threshold_results,
+        output_path=THRESHOLD_PLOT_PATH,
+    )
+
     print(
-        f"\nSeuil sauvegardé dans : "
+        "\nGraphique F1 vs seuil sauvegardé dans : "
+        f"{THRESHOLD_PLOT_PATH}"
+    )
+
+    print(
+        "\nSeuil sauvegardé dans : "
         f"{DECISION_THRESHOLD_PATH}"
     )
 
     print(
-        f"Résultats détaillés : "
+        "Résultats détaillés : "
         f"{THRESHOLD_RESULTS_PATH}"
     )
 
     print(
-        f"Prédictions out-of-fold : "
+        "Prédictions out-of-fold : "
         f"{OOF_PREDICTIONS_PATH}"
     )
-    print(f"Entraînement terminé, les modèles sont sauvegardés dans : {MODELS_DIR}")
+
+    print(
+        "Résumé de l'expérience : "
+        f"{EXPERIMENT_SUMMARY_PATH}"
+    )
+
+    print(
+        "Entraînement terminé. "
+        f"Les {K_FOLDS} modèles sont dans : "
+        f"{MODELS_DIR}"
+    )
+
 
 if __name__ == "__main__":
     main()
+    

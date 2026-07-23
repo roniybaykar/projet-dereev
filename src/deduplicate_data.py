@@ -19,8 +19,8 @@ import pandas as pd
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = BASE_DIR / "data" / "raw" / "dereev_data_3.xlsx"
-DEFAULT_OUTPUT = BASE_DIR / "data" / "raw" / "dereev_data_3_deduplicated.xlsx"
+DEFAULT_INPUT = BASE_DIR / "data" / "raw" / "dereev_data_4.xlsx"
+DEFAULT_OUTPUT = BASE_DIR / "data" / "raw" / "dereev_data_4_deduplicated.xlsx"
 DEFAULT_AUDIT_DIR = BASE_DIR / "data" / "processed" / "deduplication_audit"
 
 TEXT_COL = "cn_notes"
