@@ -913,18 +913,4 @@ Pour comparer deux modèles correctement, conserver :
 
 Une reproductibilité bit à bit peut encore dépendre du GPU, de CUDA, de PyTorch, de Transformers et de certaines opérations natives. Les versions logicielles et le matériel utilisés doivent être consignés avec les résultats.
 
-## 19. Checklist de livraison
 
-- [ ] Les données brutes et traitées sont absentes du commit.
-- [ ] La revue `merge`/`separate` est conservée localement dans `pairs_reviewed.csv`.
-- [ ] Aucun `leakage_group_id` ne traverse train et test.
-- [ ] Les modèles comparés utilisent le même manifeste de folds.
-- [ ] Le pilote TF-IDF fonctionne.
-- [ ] Le pilote Transformer fonctionne sur le matériel cible.
-- [ ] Aucun fichier du dossier `models/` n’est présent dans le commit.
-- [ ] Il est clairement indiqué que l’API nécessite un bundle transmis séparément.
-- [ ] Si le bundle local est disponible, l’API répond sur `/health` et `/predict`.
-- [ ] Aucun texte patient n’est présent dans un script, notebook, log ou rapport versionné.
-- [ ] Le dépôt et les autorisations de diffusion des poids ont été vérifiés.
-
-Le dépôt est alors prêt à être transmis à un data scientist qui pourra reproduire la préparation, lancer les entraînements et évaluer les résultats. L’utilisation de l’API nécessite en plus la récupération séparée du bundle de production.
