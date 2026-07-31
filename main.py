@@ -68,8 +68,10 @@ from src.config import (
     CV_SPLIT_SEED,
     TRAINING_SEEDS,
     K_FOLDS,
+    GROUP_COL,
     LABEL_COL,
     LEARNING_RATE,
+    MAX_LENGTH,
     MODEL_DISPLAY_NAME,
     MODEL_NAME,
     MODEL_OUTPUT_NAME,
@@ -685,7 +687,7 @@ def run_one_training_seed(
     print(f"Durée totale de la seed : {format_duration(seed_duration)}")
 
     summary = {
-        "protocol": "fixed_shared_stratified_kfold_multi_training_seeds",
+        "protocol": "fixed_shared_stratified_group_kfold_multi_training_seeds",
         "model_display_name": MODEL_DISPLAY_NAME,
         "model_name": MODEL_NAME,
         "model_output_name": MODEL_OUTPUT_NAME,
@@ -709,6 +711,20 @@ def run_one_training_seed(
             os.path.join(seed_dir, f"fold_{fold_index}")
             for fold_index in range(1, shared_split.fold_count + 1)
         ],
+        "training_configuration": {
+            "max_length": int(MAX_LENGTH),
+            "batch_size": int(BATCH_SIZE),
+            "epochs_max": int(EPOCHS),
+            "learning_rate": float(LEARNING_RATE),
+            "early_stopping_patience": int(EARLY_STOPPING_PATIENCE),
+            "early_stopping_threshold": float(EARLY_STOPPING_THRESHOLD),
+            "loss": "weighted_cross_entropy",
+            "threshold_selection": "maximum_positive_f1_on_seed_oof_only",
+        },
+        "uncertainty_scope": (
+            "Les écarts-types entre seeds sont calculés à split fixe et ne "
+            "capturent pas la variance de partition des données."
+        ),
     }
 
     with open(paths["summary_json"], "w", encoding="utf-8") as file:
@@ -776,7 +792,7 @@ def aggregate_seed_summaries(
         }
 
     benchmark_summary = {
-        "protocol": "fixed_shared_stratified_kfold_multi_training_seeds",
+        "protocol": "fixed_shared_stratified_group_kfold_multi_training_seeds",
         "model_display_name": MODEL_DISPLAY_NAME,
         "model_name": MODEL_NAME,
         "model_output_name": MODEL_OUTPUT_NAME,
@@ -786,6 +802,19 @@ def aggregate_seed_summaries(
         "fold_count": summaries[0]["fold_count"],
         "total_fine_tunings": int(len(summaries) * summaries[0]["fold_count"]),
         "standard_deviation_definition": "sample_std_ddof_1_across_seeds",
+        "error_bar_scope": (
+            "Variabilité inter-seed uniquement, avec partition train/test et "
+            "folds figés. La variance de split n'est pas incluse."
+        ),
+        "training_configuration": {
+            "max_length": int(MAX_LENGTH),
+            "batch_size": int(BATCH_SIZE),
+            "epochs_max": int(EPOCHS),
+            "learning_rate": float(LEARNING_RATE),
+            "early_stopping_patience": int(EARLY_STOPPING_PATIENCE),
+            "early_stopping_threshold": float(EARLY_STOPPING_THRESHOLD),
+            "loss": "weighted_cross_entropy",
+        },
         "aggregate_validation_metrics": aggregate_metrics,
         "seed_summaries": summaries,
         "all_seeds_validation_csv": results_csv,
@@ -935,7 +964,7 @@ def main(args: argparse.Namespace) -> None:
     train_dataframe = pd.read_csv(TRAIN_CV_CSV)
     missing_columns = [
         column
-        for column in (TEXT_COL, LABEL_COL)
+        for column in (TEXT_COL, LABEL_COL, GROUP_COL)
         if column not in train_dataframe.columns
     ]
     if missing_columns:
@@ -945,13 +974,38 @@ def main(args: argparse.Namespace) -> None:
         )
 
     labels = train_dataframe[LABEL_COL].to_numpy(dtype=int)
+    groups = train_dataframe[GROUP_COL].fillna("").astype(str).to_numpy()
     fingerprint = dataset_fingerprint(
         dataframe=train_dataframe,
         text_column=TEXT_COL,
         label_column=LABEL_COL,
+        group_column=GROUP_COL,
     )
 
     prepare_model_root(overwrite=args.overwrite)
+
+    run_configuration = {
+        "protocol": "fixed_shared_stratified_group_kfold_multi_training_seeds",
+        "model_display_name": MODEL_DISPLAY_NAME,
+        "model_name": MODEL_NAME,
+        "model_output_name": MODEL_OUTPUT_NAME,
+        "max_length": int(MAX_LENGTH),
+        "batch_size": int(BATCH_SIZE),
+        "epochs_max": int(EPOCHS),
+        "learning_rate": float(LEARNING_RATE),
+        "early_stopping_patience": int(EARLY_STOPPING_PATIENCE),
+        "early_stopping_threshold": float(EARLY_STOPPING_THRESHOLD),
+        "training_seeds": [int(seed) for seed in seeds],
+        "split_seed": int(CV_SPLIT_SEED),
+        "fold_count": int(args.folds),
+        "error_bar_scope": "inter_seed_variability_at_fixed_split_only",
+    }
+    with open(
+        os.path.join(MODEL_ROOT, "run_configuration.json"),
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(run_configuration, file, indent=2, ensure_ascii=False)
 
     print_banner("BENCHMARK DEREEV — PROTOCOLE A STRICT")
     print_key_values(
@@ -963,6 +1017,7 @@ def main(args: argparse.Namespace) -> None:
             ("Jeu test fixe", TEST_CSV),
             ("Seeds d'entraînement", ", ".join(map(str, seeds))),
             ("Seed du split fixe", CV_SPLIT_SEED),
+            ("Nombre de groupes train", len(set(groups))),
             ("Nombre de folds", args.folds),
             ("Fine-tunings prévus", len(seeds) * args.folds),
             ("Métriques principales", "F1 positif et PR-AUC"),
@@ -971,13 +1026,14 @@ def main(args: argparse.Namespace) -> None:
         ]
     )
     print(
-        "\nGARANTIE PROTOCOLE A : une seule affectation des lignes aux folds "
+        "\nGARANTIE PROTOCOLE A : une seule affectation des groupes documentaires aux folds "
         "est créée avec CV_SPLIT_SEED. Elle est réutilisée sans aucune "
         "modification pour toutes les seeds d'entraînement et tous les modèles."
     )
 
     shared_split = ensure_shared_split(
         labels=labels,
+        groups=groups,
         split_seed=CV_SPLIT_SEED,
         fold_count=args.folds,
         split_directory=CV_SPLITS_DIR,
@@ -995,7 +1051,7 @@ def main(args: argparse.Namespace) -> None:
         ]],
     )
     print(
-        "CONFIRMATION : les indices train/validation ci-dessus seront "
+        "CONFIRMATION : les groupes et indices train/validation ci-dessus seront "
         f"strictement identiques pour les {len(seeds)} seeds d'entraînement."
     )
 
@@ -1034,7 +1090,7 @@ def main(args: argparse.Namespace) -> None:
 
     latest_summary = {
         "task": "multi_seed_cross_validation",
-        "protocol": "fixed_shared_stratified_kfold_multi_training_seeds",
+        "protocol": "fixed_shared_stratified_group_kfold_multi_training_seeds",
         "model_display_name": MODEL_DISPLAY_NAME,
         "model_name": MODEL_NAME,
         "model_output_name": MODEL_OUTPUT_NAME,

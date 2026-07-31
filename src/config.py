@@ -28,6 +28,7 @@ DICT_ABREV = os.path.join(RESSOURCES_DIR, "abreviations", "dico_global.json")
 # ---------------------------------------------------------------------
 TEXT_COL = "cn_notes"
 LABEL_COL = "reev_classe"
+GROUP_COL = "leakage_group_id"
 TEST_SIZE = 0.15
 
 # Seed utilisée uniquement pour créer le split externe train_cv / test.
@@ -51,9 +52,9 @@ EXPERIMENT_SEEDS = TRAINING_SEEDS
 # ---------------------------------------------------------------------
 # PARAMÈTRES DU MODÈLE TRANSFORMER
 # ---------------------------------------------------------------------
-MODEL_DISPLAY_NAME = "EuroBERT-210m"
-MODEL_NAME = "EuroBERT/EuroBERT-210m"
-MODEL_OUTPUT_NAME = "eurobert_210m"
+MODEL_DISPLAY_NAME = "DoctoBERT-fr-base"
+MODEL_NAME = "doctolib-lab/doctobert-fr-base"
+MODEL_OUTPUT_NAME = "doctobert_fr_base"
 
 MAX_LENGTH = 512
 BATCH_SIZE = 16
@@ -68,3 +69,11 @@ EARLY_STOPPING_THRESHOLD = 0.001
 # ---------------------------------------------------------------------
 TFIDF_DISPLAY_NAME = "TF-IDF + régression logistique"
 TFIDF_OUTPUT_NAME = "tfidf_lr"
+# ---------------------------------------------------------------------
+# INCERTITUDE ET REPORTING
+# ---------------------------------------------------------------------
+# Les écarts-types du benchmark restent des écarts-types inter-seed à split fixe.
+# Le bootstrap ci-dessous estime séparément l'incertitude d'échantillonnage du test.
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_SEED = 2026
+DEFAULT_DEPLOYMENT_STRATEGY = "fold_ensemble"

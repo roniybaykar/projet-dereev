@@ -1,16 +1,14 @@
-"""Évaluation finale multi-seeds du modèle Transformer DEREEV.
+"""Évaluation finale multi-seeds du benchmark Transformer DEREEV.
 
-Ce script charge, pour chaque seed d'entraînement, les K modèles des folds fixes,
-moyenne leurs probabilités sur le jeu de test fixe, applique :
+Cette version rapporte séparément, pour chaque seed :
 
-- le seuil standard 0.5 ;
-- le seuil choisi uniquement sur les prédictions OOF de cette seed.
+1. la moyenne des performances des cinq modèles de fold pris individuellement ;
+2. la performance de l'ensemble obtenu en moyennant leurs probabilités.
 
-Le résultat principal est ensuite présenté sous la forme moyenne ± écart-type
-entre les seeds d'entraînement. Le test n'est jamais utilisé pour choisir le seuil.
-
-Commande recommandée :
-    python3 -m evaluate
+Les seuils optimisés sont sélectionnés exclusivement sur les prédictions OOF.
+Les ``moyenne ± écart-type`` mesurent uniquement la variabilité inter-seed à
+partition fixe. Des IC bootstrap à 95 % sur les observations du test sont
+également calculés pour l'incertitude d'échantillonnage.
 """
 
 from __future__ import annotations
@@ -19,12 +17,12 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 from typing import Dict, List, Sequence, Tuple
 
 _FIXED_HASH_SEED = "0"
-
 if os.environ.get("PYTHONHASHSEED") != _FIXED_HASH_SEED:
     environment = os.environ.copy()
     environment["PYTHONHASHSEED"] = _FIXED_HASH_SEED
@@ -44,35 +42,46 @@ import torch
 from sklearn.metrics import log_loss
 from transformers import AutoModelForSequenceClassification, Trainer, set_seed
 
+from src.benchmark_statistics import (
+    aggregate_metric_dicts,
+    aggregate_scalar_values,
+    bootstrap_mean_metrics_across_systems,
+    metric_bundle,
+)
 from src.config import (
     BENCHMARK_MODELS_DIR,
     CV_SPLIT_SEED,
-    TRAINING_SEEDS,
     K_FOLDS,
     MODEL_DISPLAY_NAME,
     MODEL_NAME,
     MODEL_OUTPUT_NAME,
     TEST_CSV,
+    TRAINING_SEEDS,
     TRAIN_CV_CSV,
 )
 from src.cv_protocol import parse_seed_list
 from src.data_loader import get_tokenized_datasets
 from src.threshold_metrics import (
-    add_pr_auc_to_metrics,
-    compute_threshold_metrics,
     logits_to_positive_probabilities,
     plot_precision_recall_curve,
 )
 
-
 DEFAULT_DECISION_THRESHOLD = 0.5
 MODEL_ROOT = os.path.join(BENCHMARK_MODELS_DIR, MODEL_OUTPUT_NAME)
+GROUP_AWARE_PROTOCOL = "fixed_shared_stratified_group_kfold_multi_training_seeds"
+
+# Audit des contradictions fortes entre les cinq modèles de fold.
+# Exemple détecté : certains folds proches de 1 et d'autres proches de 0.
+STRONG_DISAGREEMENT_HIGH = 0.80
+STRONG_DISAGREEMENT_LOW = 0.20
+
+# Caractères de contrôle interdits dans les fichiers Excel .xlsx.
+EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F]"
+)
 
 
-# ---------------------------------------------------------------------
-# AFFICHAGE TERMINAL
-# ---------------------------------------------------------------------
-def print_banner(title: str, width: int = 84, character: str = "=") -> None:
+def print_banner(title: str, width: int = 92, character: str = "=") -> None:
     print("\n" + character * width)
     print(f" {title}")
     print(character * width)
@@ -88,33 +97,21 @@ def print_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> Non
     if not rows:
         print("(aucune ligne)")
         return
-
     rendered = [[str(value) for value in row] for row in rows]
     widths = [len(header) for header in headers]
     for row in rendered:
         for index, value in enumerate(row):
             widths[index] = max(widths[index], len(value))
-
     separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
     print(separator)
-    print(
-        "| "
-        + " | ".join(
-            header.ljust(widths[index])
-            for index, header in enumerate(headers)
-        )
-        + " |"
-    )
+    print("| " + " | ".join(
+        header.ljust(widths[index]) for index, header in enumerate(headers)
+    ) + " |")
     print(separator)
     for row in rendered:
-        print(
-            "| "
-            + " | ".join(
-                value.ljust(widths[index])
-                for index, value in enumerate(row)
-            )
-            + " |"
-        )
+        print("| " + " | ".join(
+            value.ljust(widths[index]) for index, value in enumerate(row)
+        ) + " |")
     print(separator)
 
 
@@ -129,52 +126,16 @@ def format_duration(seconds: float) -> str:
     return f"{seconds} s"
 
 
-def sample_std(values: Sequence[float]) -> float:
-    array = np.asarray(values, dtype=float)
-    if len(array) < 2:
-        return 0.0
-    return float(np.std(array, ddof=1))
-
-
-def print_metrics_block(title: str, metrics: Dict) -> None:
-    print(f"\n{title}")
-    print("-" * len(title))
-    print_key_values(
-        [
-            ("Seuil", f"{metrics['threshold']:.3f}"),
-            ("F1 positif", f"{metrics['f1']:.4f}"),
-            ("PR-AUC", f"{metrics['pr_auc']:.4f}"),
-            ("Recall", f"{metrics['recall']:.4f}"),
-            ("Précision", f"{metrics['precision']:.4f}"),
-            ("Accuracy", f"{metrics['accuracy']:.4f}"),
-        ]
-    )
-    print("\nMatrice de confusion")
-    print_table(
-        ["Réel / Prédit", "Classe 0", "Classe 1"],
-        [
-            ["Classe 0", metrics["true_negative"], metrics["false_positive"]],
-            ["Classe 1", metrics["false_negative"], metrics["true_positive"]],
-        ],
-    )
-
-
-# ---------------------------------------------------------------------
-# OUTILS
-# ---------------------------------------------------------------------
 def configure_determinism(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     set_seed(seed)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
     if hasattr(torch.backends, "cuda"):
         torch.backends.cuda.matmul.allow_tf32 = False
     if hasattr(torch.backends, "cudnn"):
@@ -188,481 +149,623 @@ def read_json(path: str) -> Dict:
         return json.load(file)
 
 
-def metrics_with_pr_auc(
-    labels: np.ndarray,
-    probabilities: np.ndarray,
-    threshold: float,
-) -> Dict:
-    return add_pr_auc_to_metrics(
-        metrics=compute_threshold_metrics(
-            labels=labels,
-            probabilities=probabilities,
-            threshold=threshold,
-        ),
-        labels=labels,
-        probabilities=probabilities,
-    )
+def save_json(path: str, content: Dict) -> None:
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(content, file, indent=2, ensure_ascii=False)
 
 
-def predict_with_model(model_path: str, test_ds) -> Tuple[np.ndarray, np.ndarray]:
+def predict_with_model(model_path: str, test_dataset) -> Tuple[np.ndarray, np.ndarray]:
     if not os.path.isdir(model_path):
         raise FileNotFoundError(f"Modèle introuvable : {model_path}")
-
     model = AutoModelForSequenceClassification.from_pretrained(model_path)
     trainer = Trainer(model=model)
-    prediction_output = trainer.predict(test_ds)
-
-    probabilities = logits_to_positive_probabilities(
-        prediction_output.predictions
-    )
-    labels = np.asarray(prediction_output.label_ids, dtype=int)
-
-    del trainer
-    del model
+    output = trainer.predict(test_dataset)
+    probabilities = logits_to_positive_probabilities(output.predictions)
+    labels = np.asarray(output.label_ids, dtype=int)
+    del trainer, model, output
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
     return probabilities, labels
 
 
-# ---------------------------------------------------------------------
-# ÉVALUATION D'UNE SEED
-# ---------------------------------------------------------------------
+def _metric_row(prefix: str, metrics: Dict) -> Dict[str, float]:
+    return {
+        f"{prefix}_f1": metrics["f1"],
+        f"{prefix}_precision": metrics["precision"],
+        f"{prefix}_recall": metrics["recall"],
+        f"{prefix}_accuracy": metrics["accuracy"],
+        f"{prefix}_pr_auc": metrics["pr_auc"],
+    }
+
+
+
+def sanitize_dataframe_for_excel(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Retire uniquement les caractères de contrôle interdits par Excel."""
+    sanitized = dataframe.copy()
+
+    for column in sanitized.columns:
+        if (
+            pd.api.types.is_object_dtype(sanitized[column])
+            or pd.api.types.is_string_dtype(sanitized[column])
+        ):
+            sanitized[column] = sanitized[column].map(
+                lambda value: (
+                    EXCEL_ILLEGAL_CHARACTERS_RE.sub("", value)
+                    if isinstance(value, str)
+                    else value
+                )
+            )
+
+    return sanitized
+
+
+def export_disagreement_workbook(
+    all_predictions: pd.DataFrame,
+    strong_disagreements: pd.DataFrame,
+    output_path: str,
+) -> None:
+    """Crée un seul classeur avec toutes les prédictions et les désaccords."""
+    all_predictions_excel = sanitize_dataframe_for_excel(all_predictions)
+    strong_disagreements_excel = sanitize_dataframe_for_excel(
+        strong_disagreements
+    )
+
+    try:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            all_predictions_excel.to_excel(
+                writer,
+                sheet_name="toutes_predictions",
+                index=False,
+            )
+            strong_disagreements_excel.to_excel(
+                writer,
+                sheet_name="forts_desaccords",
+                index=False,
+            )
+    except ImportError as error:
+        raise RuntimeError(
+            "openpyxl est requis pour l'export Excel. "
+            "Installez-le avec : pip install openpyxl"
+        ) from error
+
+
 def evaluate_one_seed(
     training_seed: int,
     fold_count: int,
-    test_ds,
+    test_dataset,
+    test_metadata: pd.DataFrame,
 ) -> Tuple[Dict, np.ndarray, np.ndarray]:
     seed_start = time.perf_counter()
     configure_determinism(training_seed)
 
-    seed_dir = os.path.join(MODEL_ROOT, f"seed_{training_seed}")
-    summary_path = os.path.join(seed_dir, "experiment_summary.json")
-    threshold_path = os.path.join(seed_dir, "decision_threshold.json")
-
+    seed_directory = os.path.join(MODEL_ROOT, f"seed_{training_seed}")
+    summary_path = os.path.join(seed_directory, "experiment_summary.json")
+    threshold_path = os.path.join(seed_directory, "decision_threshold.json")
     if not os.path.exists(summary_path):
-        raise FileNotFoundError(
-            f"Résumé d'entraînement introuvable pour la seed "
-            f"{training_seed} : {summary_path}"
-        )
+        raise FileNotFoundError(f"Résumé d'entraînement introuvable : {summary_path}")
     if not os.path.exists(threshold_path):
-        raise FileNotFoundError(
-            f"Seuil OOF introuvable pour la seed {training_seed} : "
-            f"{threshold_path}"
-        )
+        raise FileNotFoundError(f"Seuil OOF introuvable : {threshold_path}")
 
     training_summary = read_json(summary_path)
     threshold_summary = read_json(threshold_path)
-
     trained_fold_count = int(training_summary.get("fold_count", fold_count))
     if trained_fold_count != fold_count:
         raise RuntimeError(
-            f"La seed {training_seed} a été entraînée avec "
-            f"{trained_fold_count} folds, mais l'évaluation en demande "
-            f"{fold_count}."
+            f"Seed {training_seed} entraînée avec {trained_fold_count} folds, "
+            f"mais évaluation demandée avec {fold_count}."
         )
-
-    trained_split_seed = int(
-        training_summary.get("split_seed", CV_SPLIT_SEED)
-    )
-    if trained_split_seed != CV_SPLIT_SEED:
-        raise RuntimeError(
-            f"La seed d'entraînement {training_seed} utilise le split "
-            f"{trained_split_seed}, alors que config.py impose le split "
-            f"fixe {CV_SPLIT_SEED}."
-        )
-
-    expected_protocol = "fixed_shared_stratified_kfold_multi_training_seeds"
     trained_protocol = training_summary.get("protocol")
-    if trained_protocol != expected_protocol:
+    if trained_protocol != GROUP_AWARE_PROTOCOL:
         raise RuntimeError(
-            f"Protocole incompatible pour la seed {training_seed} : "
-            f"{trained_protocol!r}. Relancez l'entraînement avec la version "
-            "corrigée du protocole A strict."
+            f"Protocole incompatible : {trained_protocol!r}. "
+            "Réentraînez avec StratifiedGroupKFold."
         )
+    trained_split_seed = int(training_summary.get("split_seed", CV_SPLIT_SEED))
+    if trained_split_seed != CV_SPLIT_SEED:
+        raise RuntimeError("La seed du split ne correspond pas à config.py.")
 
     optimized_threshold = float(
         threshold_summary.get("best_threshold", DEFAULT_DECISION_THRESHOLD)
     )
 
-    print_banner(
-        f"TEST — SEED {training_seed} — {MODEL_DISPLAY_NAME}",
-        character="#",
-    )
-    print_key_values(
-        [
-            ("Modèle", f"{MODEL_DISPLAY_NAME} ({MODEL_NAME})"),
-            ("Seed d'entraînement", training_seed),
-            ("Seed du split fixe", trained_split_seed),
-            ("Folds à agréger", fold_count),
-            ("Seuil OOF chargé", f"{optimized_threshold:.3f}"),
-            ("Dossier", seed_dir),
-        ]
-    )
+    print_banner(f"TEST — SEED {training_seed} — {MODEL_DISPLAY_NAME}", character="#")
+    print_key_values([
+        ("Seed d'entraînement", training_seed),
+        ("Folds", fold_count),
+        ("Seuil OOF", f"{optimized_threshold:.3f}"),
+        ("Comparaison", "modèles individuels de fold vs ensemble des folds"),
+    ])
 
     fold_probabilities: List[np.ndarray] = []
-    test_labels = None
+    fold_rows: List[Dict] = []
+    reference_labels: np.ndarray | None = None
 
     for fold_index in range(1, fold_count + 1):
-        model_path = os.path.join(seed_dir, f"fold_{fold_index}")
-        print(
-            f"\n[{fold_index}/{fold_count}] Prédiction test avec "
-            f"seed_{training_seed}/fold_{fold_index}"
-        )
-        probabilities, labels = predict_with_model(model_path, test_ds)
+        model_path = os.path.join(seed_directory, f"fold_{fold_index}")
+        print(f"[{fold_index}/{fold_count}] Prédiction du test avec {model_path}")
+        probabilities, labels = predict_with_model(model_path, test_dataset)
+        if reference_labels is None:
+            reference_labels = labels
+        elif not np.array_equal(reference_labels, labels):
+            raise RuntimeError("Les labels test diffèrent entre les folds.")
 
-        if test_labels is None:
-            test_labels = labels
-        elif not np.array_equal(test_labels, labels):
-            raise RuntimeError(
-                "Les labels du test diffèrent entre les modèles des folds."
-            )
-
+        default_metrics = metric_bundle(labels, probabilities, 0.5)
+        optimized_metrics = metric_bundle(labels, probabilities, optimized_threshold)
+        fold_rows.append({
+            "model_display_name": MODEL_DISPLAY_NAME,
+            "model_output_name": MODEL_OUTPUT_NAME,
+            "training_seed": int(training_seed),
+            "fold": int(fold_index),
+            "optimized_threshold_selected_on_seed_oof": optimized_threshold,
+            **_metric_row("individual_default", default_metrics),
+            **_metric_row("individual_optimized", optimized_metrics),
+            "model_path": model_path,
+        })
         fold_probabilities.append(probabilities)
 
+    assert reference_labels is not None
     probability_matrix = np.stack(fold_probabilities, axis=0)
     ensemble_probabilities = np.mean(probability_matrix, axis=0)
-
-    default_metrics = metrics_with_pr_auc(
-        labels=test_labels,
-        probabilities=ensemble_probabilities,
-        threshold=DEFAULT_DECISION_THRESHOLD,
+    ensemble_default = metric_bundle(reference_labels, ensemble_probabilities, 0.5)
+    ensemble_optimized = metric_bundle(
+        reference_labels, ensemble_probabilities, optimized_threshold
     )
-    optimized_metrics = metrics_with_pr_auc(
-        labels=test_labels,
-        probabilities=ensemble_probabilities,
-        threshold=optimized_threshold,
+    individual_default_metrics = [
+        metric_bundle(reference_labels, probabilities, 0.5)
+        for probabilities in fold_probabilities
+    ]
+    individual_optimized_metrics = [
+        metric_bundle(reference_labels, probabilities, optimized_threshold)
+        for probabilities in fold_probabilities
+    ]
+    individual_default_aggregate = aggregate_metric_dicts(individual_default_metrics)
+    individual_optimized_aggregate = aggregate_metric_dicts(individual_optimized_metrics)
+
+    probability_pairs = np.column_stack([
+        1.0 - ensemble_probabilities,
+        ensemble_probabilities,
+    ])
+    final_log_loss = float(log_loss(reference_labels, probability_pairs, labels=[0, 1]))
+    fold_disagreement = float(np.mean(np.std(probability_matrix, axis=0, ddof=0)))
+
+    fold_results_path = os.path.join(seed_directory, "individual_fold_test_results.csv")
+    pd.DataFrame(fold_rows).to_csv(fold_results_path, index=False)
+
+    if len(test_metadata) != reference_labels.size:
+        raise RuntimeError(
+            "Le nombre de lignes du fichier test brut ne correspond pas "
+            "au nombre de prédictions du dataset tokenisé."
+        )
+
+    # On conserve les colonnes originales du test, notamment cn_notes et pat_ipp
+    # lorsqu'elles existent, sans modifier le dataset ni l'entraînement.
+    predictions_dataframe = test_metadata.reset_index(drop=True).copy()
+    predictions_dataframe.insert(
+        0,
+        "row_index",
+        np.arange(reference_labels.size, dtype=int),
+    )
+    predictions_dataframe["label_evaluation"] = reference_labels
+    predictions_dataframe["training_seed"] = int(training_seed)
+
+    for fold_index, probabilities in enumerate(fold_probabilities, start=1):
+        predictions_dataframe[
+            f"fold_{fold_index}_probability_class_1"
+        ] = probabilities
+
+    probability_min = np.min(probability_matrix, axis=0)
+    probability_max = np.max(probability_matrix, axis=0)
+    probability_range = probability_max - probability_min
+    probability_std = np.std(probability_matrix, axis=0, ddof=0)
+    positive_votes = np.sum(probability_matrix >= 0.5, axis=0)
+
+    strong_disagreement = (
+        (probability_max >= STRONG_DISAGREEMENT_HIGH)
+        & (probability_min <= STRONG_DISAGREEMENT_LOW)
     )
 
-    probability_pairs = np.column_stack(
-        [1.0 - ensemble_probabilities, ensemble_probabilities]
+    predictions_dataframe["probability_class_1"] = ensemble_probabilities
+    predictions_dataframe["prediction_threshold_0_5"] = (
+        ensemble_probabilities >= 0.5
+    ).astype(int)
+    predictions_dataframe["optimized_threshold_from_oof"] = (
+        optimized_threshold
     )
-    final_log_loss = float(
-        log_loss(test_labels, probability_pairs, labels=[0, 1])
-    )
-    fold_disagreement = float(
-        np.mean(np.std(probability_matrix, axis=0, ddof=0))
+    predictions_dataframe["prediction_optimized_threshold"] = (
+        ensemble_probabilities >= optimized_threshold
+    ).astype(int)
+
+    predictions_dataframe["positive_votes_threshold_0_5"] = positive_votes
+    predictions_dataframe["probability_min_across_folds"] = probability_min
+    predictions_dataframe["probability_max_across_folds"] = probability_max
+    predictions_dataframe["probability_range_across_folds"] = probability_range
+    predictions_dataframe["probability_std_across_folds"] = probability_std
+    predictions_dataframe["strong_disagreement"] = strong_disagreement
+    predictions_dataframe["disagreement_rule"] = np.where(
+        strong_disagreement,
+        (
+            f"max >= {STRONG_DISAGREEMENT_HIGH:.2f} "
+            f"et min <= {STRONG_DISAGREEMENT_LOW:.2f}"
+        ),
+        "",
     )
 
-    duration = time.perf_counter() - seed_start
+    predictions_path = os.path.join(seed_directory, "test_predictions.csv")
+    predictions_dataframe.to_csv(predictions_path, index=False)
 
-    print_metrics_block("TEST — SEUIL STANDARD 0.5", default_metrics)
-    print_metrics_block(
-        "TEST — SEUIL OPTIMISÉ SUR LES OOF DE CETTE SEED",
-        optimized_metrics,
-    )
-    print_key_values(
-        [
-            ("Log loss", f"{final_log_loss:.4f}"),
-            ("Désaccord moyen entre folds", f"{fold_disagreement:.4f}"),
-            ("Durée de l'évaluation", format_duration(duration)),
-        ]
-    )
-
-    predictions_path = os.path.join(seed_dir, "test_predictions.csv")
-    pr_curve_path = os.path.join(seed_dir, "test_precision_recall_curve.png")
-    results_path = os.path.join(seed_dir, "test_results.json")
-
-    pd.DataFrame(
-        {
-            "label": test_labels,
-            "training_seed": training_seed,
-            "probability_class_1": ensemble_probabilities,
-            "prediction_threshold_0_5": (
-                ensemble_probabilities >= DEFAULT_DECISION_THRESHOLD
-            ).astype(int),
-            "prediction_optimized_threshold": (
-                ensemble_probabilities >= optimized_threshold
-            ).astype(int),
-        }
-    ).to_csv(predictions_path, index=False)
-
+    pr_curve_path = os.path.join(seed_directory, "test_precision_recall_curve.png")
     plot_precision_recall_curve(
-        labels=test_labels,
+        labels=reference_labels,
         probabilities=ensemble_probabilities,
         output_path=pr_curve_path,
     )
 
+    duration = time.perf_counter() - seed_start
     result = {
+        "protocol": GROUP_AWARE_PROTOCOL,
         "model_display_name": MODEL_DISPLAY_NAME,
         "model_name": MODEL_NAME,
-        "training_seed": training_seed,
-        "split_seed": trained_split_seed,
-        "fold_count": fold_count,
+        "model_output_name": MODEL_OUTPUT_NAME,
+        "training_seed": int(training_seed),
+        "split_seed": int(trained_split_seed),
+        "fold_count": int(fold_count),
         "optimized_threshold_selected_on_oof": optimized_threshold,
-        "default_threshold_metrics": default_metrics,
-        "optimized_threshold_metrics": optimized_metrics,
-        "pr_auc": default_metrics["pr_auc"],
+        "individual_fold_models": {
+            "interpretation": (
+                "Moyenne des métriques des cinq modèles de fold évalués "
+                "séparément sur le même test."
+            ),
+            "default_threshold_aggregate": individual_default_aggregate,
+            "optimized_threshold_aggregate": individual_optimized_aggregate,
+            "results_csv": fold_results_path,
+        },
+        "fold_ensemble": {
+            "interpretation": (
+                "Probabilités moyennées entre les cinq modèles de fold ; "
+                "c'est un système d'ensemble distinct des modèles individuels."
+            ),
+            "default_threshold_metrics": ensemble_default,
+            "optimized_threshold_metrics": ensemble_optimized,
+            "log_loss": final_log_loss,
+            "mean_fold_probability_disagreement": fold_disagreement,
+        },
+        # Clés conservées pour compatibilité avec les anciens scripts.
+        "default_threshold_metrics": ensemble_default,
+        "optimized_threshold_metrics": ensemble_optimized,
+        "pr_auc": ensemble_default["pr_auc"],
         "log_loss": final_log_loss,
         "mean_fold_probability_disagreement": fold_disagreement,
+        "strong_disagreement_rule": {
+            "high_probability_at_least": STRONG_DISAGREEMENT_HIGH,
+            "low_probability_at_most": STRONG_DISAGREEMENT_LOW,
+        },
+        "strong_disagreement_count": int(np.sum(strong_disagreement)),
+        "strong_disagreement_rate": float(np.mean(strong_disagreement)),
         "duration_seconds": float(duration),
         "predictions_path": predictions_path,
         "pr_curve_path": pr_curve_path,
     }
+    results_path = os.path.join(seed_directory, "test_results.json")
+    save_json(results_path, result)
 
-    with open(results_path, "w", encoding="utf-8") as file:
-        json.dump(result, file, indent=2, ensure_ascii=False)
+    print_table(
+        ["Objet évalué", "F1 @0.5", "Précision", "Rappel", "PR-AUC", "F1 seuil OOF"],
+        [
+            [
+                "Moyenne des 5 modèles individuels",
+                f"{individual_default_aggregate['f1']['mean']:.4f}",
+                f"{individual_default_aggregate['precision']['mean']:.4f}",
+                f"{individual_default_aggregate['recall']['mean']:.4f}",
+                f"{individual_default_aggregate['pr_auc']['mean']:.4f}",
+                f"{individual_optimized_aggregate['f1']['mean']:.4f}",
+            ],
+            [
+                "Ensemble des 5 folds",
+                f"{ensemble_default['f1']:.4f}",
+                f"{ensemble_default['precision']:.4f}",
+                f"{ensemble_default['recall']:.4f}",
+                f"{ensemble_default['pr_auc']:.4f}",
+                f"{ensemble_optimized['f1']:.4f}",
+            ],
+        ],
+    )
+    print(f"Durée : {format_duration(duration)}")
+    return result, ensemble_probabilities, reference_labels
 
-    print(f"Prédictions sauvegardées : {predictions_path}")
-    print(f"Résumé test sauvegardé   : {results_path}")
 
-    return result, ensemble_probabilities, test_labels
+def _aggregate_columns(dataframe: pd.DataFrame, columns: Sequence[str]) -> Dict:
+    return {
+        column: aggregate_scalar_values(dataframe[column].to_numpy(dtype=float))
+        for column in columns
+    }
 
 
-# ---------------------------------------------------------------------
-# AGRÉGATION MULTI-SEEDS
-# ---------------------------------------------------------------------
 def aggregate_results(
     seed_results: Sequence[Dict],
     seed_probabilities: Sequence[np.ndarray],
     test_labels: np.ndarray,
     total_duration: float,
+    bootstrap_resamples: int,
+    bootstrap_seed: int,
+    deployment_strategy: str,
 ) -> Dict:
-    rows = []
+    rows: List[Dict] = []
+    all_fold_rows: List[pd.DataFrame] = []
+    all_prediction_rows: List[pd.DataFrame] = []
+    optimized_thresholds: List[float] = []
 
     for result in seed_results:
-        default = result["default_threshold_metrics"]
-        optimized = result["optimized_threshold_metrics"]
-        rows.append(
-            {
-                "training_seed": result["training_seed"],
-                "test_f1_threshold_0_5": default["f1"],
-                "test_precision_threshold_0_5": default["precision"],
-                "test_recall_threshold_0_5": default["recall"],
-                "test_accuracy_threshold_0_5": default["accuracy"],
-                "test_pr_auc": default["pr_auc"],
-                "test_log_loss": result["log_loss"],
-                "optimized_threshold": result[
-                    "optimized_threshold_selected_on_oof"
-                ],
-                "test_f1_optimized": optimized["f1"],
-                "test_precision_optimized": optimized["precision"],
-                "test_recall_optimized": optimized["recall"],
-                "test_accuracy_optimized": optimized["accuracy"],
-                "fold_probability_disagreement": result[
-                    "mean_fold_probability_disagreement"
-                ],
-                "duration_seconds": result["duration_seconds"],
-            }
+        seed = int(result["training_seed"])
+        threshold = float(result["optimized_threshold_selected_on_oof"])
+        optimized_thresholds.append(threshold)
+        individual_default = result["individual_fold_models"][
+            "default_threshold_aggregate"
+        ]
+        individual_optimized = result["individual_fold_models"][
+            "optimized_threshold_aggregate"
+        ]
+        ensemble_default = result["fold_ensemble"]["default_threshold_metrics"]
+        ensemble_optimized = result["fold_ensemble"]["optimized_threshold_metrics"]
+        rows.append({
+            "training_seed": seed,
+            "optimized_threshold": threshold,
+            "individual_mean_f1_threshold_0_5": individual_default["f1"]["mean"],
+            "individual_mean_precision_threshold_0_5": individual_default["precision"]["mean"],
+            "individual_mean_recall_threshold_0_5": individual_default["recall"]["mean"],
+            "individual_mean_pr_auc": individual_default["pr_auc"]["mean"],
+            "individual_mean_f1_optimized": individual_optimized["f1"]["mean"],
+            "individual_mean_precision_optimized": individual_optimized["precision"]["mean"],
+            "individual_mean_recall_optimized": individual_optimized["recall"]["mean"],
+            "ensemble_f1_threshold_0_5": ensemble_default["f1"],
+            "ensemble_precision_threshold_0_5": ensemble_default["precision"],
+            "ensemble_recall_threshold_0_5": ensemble_default["recall"],
+            "ensemble_accuracy_threshold_0_5": ensemble_default["accuracy"],
+            "ensemble_pr_auc": ensemble_default["pr_auc"],
+            "ensemble_f1_optimized": ensemble_optimized["f1"],
+            "ensemble_precision_optimized": ensemble_optimized["precision"],
+            "ensemble_recall_optimized": ensemble_optimized["recall"],
+            "ensemble_accuracy_optimized": ensemble_optimized["accuracy"],
+            "ensemble_log_loss": result["fold_ensemble"]["log_loss"],
+            "fold_probability_disagreement": result["fold_ensemble"][
+                "mean_fold_probability_disagreement"
+            ],
+            "duration_seconds": result["duration_seconds"],
+        })
+        all_fold_rows.append(pd.read_csv(
+            result["individual_fold_models"]["results_csv"]
+        ))
+        all_prediction_rows.append(
+            pd.read_csv(result["predictions_path"], low_memory=False)
         )
 
-    dataframe = pd.DataFrame(rows)
-    results_csv = os.path.join(MODEL_ROOT, "all_seeds_test_results.csv")
-    dataframe.to_csv(results_csv, index=False)
+    seed_dataframe = pd.DataFrame(rows)
+    seed_csv = os.path.join(MODEL_ROOT, "all_seeds_test_results.csv")
+    seed_dataframe.to_csv(seed_csv, index=False)
+    fold_dataframe = pd.concat(all_fold_rows, ignore_index=True)
+    fold_csv = os.path.join(MODEL_ROOT, "all_fold_models_test_results.csv")
+    fold_dataframe.to_csv(fold_csv, index=False)
 
-    metric_columns = [
-        "test_f1_threshold_0_5",
-        "test_precision_threshold_0_5",
-        "test_recall_threshold_0_5",
-        "test_accuracy_threshold_0_5",
-        "test_pr_auc",
-        "test_log_loss",
-        "optimized_threshold",
-        "test_f1_optimized",
-        "test_precision_optimized",
-        "test_recall_optimized",
-        "test_accuracy_optimized",
-        "fold_probability_disagreement",
+    all_predictions_dataframe = pd.concat(
+        all_prediction_rows,
+        ignore_index=True,
+    )
+    all_predictions_csv = os.path.join(
+        MODEL_ROOT,
+        "all_seeds_detailed_test_predictions.csv",
+    )
+    all_predictions_dataframe.to_csv(all_predictions_csv, index=False)
+
+    strong_disagreements_dataframe = all_predictions_dataframe.loc[
+        all_predictions_dataframe["strong_disagreement"].astype(bool)
+    ].copy()
+
+    disagreement_csv = os.path.join(
+        MODEL_ROOT,
+        "strong_fold_disagreements.csv",
+    )
+    strong_disagreements_dataframe.to_csv(disagreement_csv, index=False)
+
+    disagreement_excel = os.path.join(
+        MODEL_ROOT,
+        "fold_disagreement_audit.xlsx",
+    )
+    export_disagreement_workbook(
+        all_predictions=all_predictions_dataframe,
+        strong_disagreements=strong_disagreements_dataframe,
+        output_path=disagreement_excel,
+    )
+
+    aggregate_columns = [
+        column for column in seed_dataframe.columns
+        if column not in {"training_seed", "duration_seconds"}
     ]
+    aggregates = _aggregate_columns(seed_dataframe, aggregate_columns)
 
-    aggregates = {}
-    for column in metric_columns:
-        values = dataframe[column].to_numpy(dtype=float)
-        aggregates[column] = {
-            "mean": float(np.mean(values)),
-            "std": sample_std(values),
-            "min": float(np.min(values)),
-            "max": float(np.max(values)),
-        }
-
-    # Résultat secondaire : moyenne des ensembles de chaque seed.
-    # Avec le même nombre de folds par seed, cela équivaut à la moyenne des
-    # probabilités produites par les 25 modèles. Il ne remplace pas la moyenne
-    # ± écart-type entre seeds, qui reste le résultat principal du protocole.
-    seed_probability_matrix = np.stack(seed_probabilities, axis=0)
-    all_models_probabilities = np.mean(seed_probability_matrix, axis=0)
-    all_models_metrics = metrics_with_pr_auc(
+    probability_matrix = np.stack(seed_probabilities, axis=0)
+    default_bootstrap = bootstrap_mean_metrics_across_systems(
         labels=test_labels,
-        probabilities=all_models_probabilities,
-        threshold=DEFAULT_DECISION_THRESHOLD,
+        probability_matrix=probability_matrix,
+        thresholds=np.repeat(0.5, len(seed_results)),
+        metric_names=("f1", "precision", "recall", "accuracy", "pr_auc"),
+        n_resamples=bootstrap_resamples,
+        random_seed=bootstrap_seed,
     )
-    seed_disagreement = float(
-        np.mean(np.std(seed_probability_matrix, axis=0, ddof=0))
-    )
-
-    grand_predictions_path = os.path.join(
-        MODEL_ROOT,
-        "all_seeds_ensemble_test_predictions.csv",
-    )
-    grand_curve_path = os.path.join(
-        MODEL_ROOT,
-        "all_seeds_ensemble_test_precision_recall_curve.png",
-    )
-
-    pd.DataFrame(
-        {
-            "label": test_labels,
-            "probability_class_1": all_models_probabilities,
-            "prediction_threshold_0_5": (
-                all_models_probabilities >= DEFAULT_DECISION_THRESHOLD
-            ).astype(int),
-        }
-    ).to_csv(grand_predictions_path, index=False)
-
-    plot_precision_recall_curve(
+    optimized_bootstrap = bootstrap_mean_metrics_across_systems(
         labels=test_labels,
-        probabilities=all_models_probabilities,
-        output_path=grand_curve_path,
+        probability_matrix=probability_matrix,
+        thresholds=optimized_thresholds,
+        metric_names=("f1", "precision", "recall", "accuracy", "pr_auc"),
+        n_resamples=bootstrap_resamples,
+        random_seed=bootstrap_seed,
     )
+    bootstrap_summary = {
+        "scope": (
+            "Incertitude d'échantillonnage sur les observations du test. "
+            "Les mêmes indices bootstrap sont utilisés pour toutes les seeds."
+        ),
+        "ensemble_threshold_0_5": default_bootstrap,
+        "ensemble_threshold_optimized_on_oof": optimized_bootstrap,
+    }
+    bootstrap_json = os.path.join(MODEL_ROOT, "bootstrap_test_confidence_intervals.json")
+    save_json(bootstrap_json, bootstrap_summary)
+    bootstrap_rows = []
+    for threshold_name, metric_results in bootstrap_summary.items():
+        if not isinstance(metric_results, dict):
+            continue
+        for metric_name, values in metric_results.items():
+            bootstrap_rows.append({
+                "evaluation": threshold_name,
+                "metric": metric_name,
+                **values,
+            })
+    bootstrap_csv = os.path.join(MODEL_ROOT, "bootstrap_test_confidence_intervals.csv")
+    pd.DataFrame(bootstrap_rows).to_csv(bootstrap_csv, index=False)
+
+    global_probabilities = np.mean(probability_matrix, axis=0)
+    global_metrics = metric_bundle(test_labels, global_probabilities, 0.5)
+    global_predictions_path = os.path.join(
+        MODEL_ROOT, "all_seeds_ensemble_test_predictions.csv"
+    )
+    pd.DataFrame({
+        "row_index": np.arange(test_labels.size, dtype=int),
+        "label": test_labels,
+        "probability_class_1": global_probabilities,
+        "prediction_threshold_0_5": (global_probabilities >= 0.5).astype(int),
+    }).to_csv(global_predictions_path, index=False)
+    global_curve_path = os.path.join(
+        MODEL_ROOT, "all_seeds_ensemble_test_precision_recall_curve.png"
+    )
+    plot_precision_recall_curve(test_labels, global_probabilities, global_curve_path)
+
+    if deployment_strategy == "fold_ensemble":
+        deployment_description = (
+            "Déploiement déclaré : ensemble des cinq modèles de fold, avec "
+            "moyenne des probabilités. Les métriques ensemble sont donc les "
+            "estimations directement pertinentes."
+        )
+    else:
+        deployment_description = (
+            "Déploiement déclaré : modèle unique. La moyenne des modèles de "
+            "fold est un proxy expérimental ; un modèle final réentraîné sur "
+            "tout train_cv devra être évalué séparément avant déploiement."
+        )
 
     summary = {
-        "protocol": "fixed_shared_stratified_kfold_multi_training_seeds",
+        "protocol": GROUP_AWARE_PROTOCOL,
         "model_display_name": MODEL_DISPLAY_NAME,
         "model_name": MODEL_NAME,
-        "training_seeds": [result["training_seed"] for result in seed_results],
-        "split_seed": seed_results[0]["split_seed"],
-        "fold_count": seed_results[0]["fold_count"],
-        "primary_reporting": "mean_and_sample_std_across_training_seeds",
+        "model_output_name": MODEL_OUTPUT_NAME,
+        "training_seeds": [int(result["training_seed"]) for result in seed_results],
+        "split_seed": int(seed_results[0]["split_seed"]),
+        "fold_count": int(seed_results[0]["fold_count"]),
+        "error_bar_scope": (
+            "Les écarts-types rapportés sont uniquement inter-seed à split fixe ; "
+            "ils ne capturent pas la variance de partition."
+        ),
+        "bootstrap_scope": bootstrap_summary["scope"],
+        "declared_deployment_strategy": deployment_strategy,
+        "deployment_interpretation": deployment_description,
+        "primary_reporting": {
+            "individual_fold_models": (
+                "Moyenne, pour chaque seed, des métriques des cinq modèles de "
+                "fold pris individuellement."
+            ),
+            "fold_ensemble": (
+                "Métriques après moyenne des probabilités des cinq folds."
+            ),
+        },
         "aggregate_test_metrics": aggregates,
-        "seed_results": seed_results,
+        "bootstrap_confidence_intervals": bootstrap_summary,
+        "seed_results": list(seed_results),
         "secondary_all_seed_fold_ensemble": {
             "description": (
-                "Moyenne des probabilités de tous les modèles seed/fold ; "
-                "résultat secondaire, sans estimation de variabilité."
+                "Moyenne des probabilités des ensembles de toutes les seeds ; "
+                "résultat descriptif secondaire."
             ),
-            "threshold": DEFAULT_DECISION_THRESHOLD,
-            "metrics": all_models_metrics,
-            "mean_probability_disagreement_across_seeds": seed_disagreement,
-            "predictions_path": grand_predictions_path,
-            "pr_curve_path": grand_curve_path,
+            "metrics_threshold_0_5": global_metrics,
+            "predictions_path": global_predictions_path,
+            "pr_curve_path": global_curve_path,
         },
-        "all_seeds_test_csv": results_csv,
+        "all_seeds_test_csv": seed_csv,
+        "all_fold_models_test_csv": fold_csv,
+        "all_seeds_detailed_predictions_csv": all_predictions_csv,
+        "strong_fold_disagreements_csv": disagreement_csv,
+        "fold_disagreement_audit_excel": disagreement_excel,
+        "strong_fold_disagreement_count": int(
+            len(strong_disagreements_dataframe)
+        ),
+        "bootstrap_json": bootstrap_json,
+        "bootstrap_csv": bootstrap_csv,
         "total_duration_seconds": float(total_duration),
     }
-
     summary_path = os.path.join(MODEL_ROOT, "test_benchmark_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as file:
-        json.dump(summary, file, indent=2, ensure_ascii=False)
+    save_json(summary_path, summary)
 
-    print_banner(
-        f"RÉSULTAT TEST FINAL MULTI-SEEDS — {MODEL_DISPLAY_NAME}",
-        character="=",
-    )
+    print_banner(f"RÉSULTATS TEST — {MODEL_DISPLAY_NAME}")
     print_table(
         [
-            "Seed",
-            "F1 test @0.5",
-            "PR-AUC test",
-            "Seuil OOF",
-            "F1 test optimisé",
-            "Log loss",
+            "Seed", "F1 individuel moyen", "F1 ensemble", "Précision ens.",
+            "Rappel ens.", "PR-AUC ens.", "Seuil OOF", "F1 ens. optimisé"
         ],
-        [
-            [
-                int(row["training_seed"]),
-                f"{row['test_f1_threshold_0_5']:.4f}",
-                f"{row['test_pr_auc']:.4f}",
-                f"{row['optimized_threshold']:.3f}",
-                f"{row['test_f1_optimized']:.4f}",
-                f"{row['test_log_loss']:.4f}",
-            ]
-            for row in rows
-        ],
+        [[
+            int(row["training_seed"]),
+            f"{row['individual_mean_f1_threshold_0_5']:.4f}",
+            f"{row['ensemble_f1_threshold_0_5']:.4f}",
+            f"{row['ensemble_precision_threshold_0_5']:.4f}",
+            f"{row['ensemble_recall_threshold_0_5']:.4f}",
+            f"{row['ensemble_pr_auc']:.4f}",
+            f"{row['optimized_threshold']:.3f}",
+            f"{row['ensemble_f1_optimized']:.4f}",
+        ] for row in rows],
     )
 
-    print("\nMoyenne ± écart-type entre les seeds")
-    print_table(
-        ["Métrique", "Moyenne", "Écart-type", "Min", "Max"],
-        [
-            [
-                "F1 test @0.5",
-                f"{aggregates['test_f1_threshold_0_5']['mean']:.4f}",
-                f"{aggregates['test_f1_threshold_0_5']['std']:.4f}",
-                f"{aggregates['test_f1_threshold_0_5']['min']:.4f}",
-                f"{aggregates['test_f1_threshold_0_5']['max']:.4f}",
-            ],
-            [
-                "PR-AUC test",
-                f"{aggregates['test_pr_auc']['mean']:.4f}",
-                f"{aggregates['test_pr_auc']['std']:.4f}",
-                f"{aggregates['test_pr_auc']['min']:.4f}",
-                f"{aggregates['test_pr_auc']['max']:.4f}",
-            ],
-            [
-                "F1 test optimisé",
-                f"{aggregates['test_f1_optimized']['mean']:.4f}",
-                f"{aggregates['test_f1_optimized']['std']:.4f}",
-                f"{aggregates['test_f1_optimized']['min']:.4f}",
-                f"{aggregates['test_f1_optimized']['max']:.4f}",
-            ],
-            [
-                "Log loss",
-                f"{aggregates['test_log_loss']['mean']:.4f}",
-                f"{aggregates['test_log_loss']['std']:.4f}",
-                f"{aggregates['test_log_loss']['min']:.4f}",
-                f"{aggregates['test_log_loss']['max']:.4f}",
-            ],
-        ],
-    )
-
-    print("\nRésultat principal à reporter sur le test :")
+    print("\nPortée des incertitudes")
+    print("- ± : variabilité inter-seed, avec split fixe.")
     print(
-        "  F1 positif test @0.5 = "
-        f"{aggregates['test_f1_threshold_0_5']['mean']:.4f} "
-        f"± {aggregates['test_f1_threshold_0_5']['std']:.4f}"
+        f"- IC 95 % : bootstrap stratifié de {bootstrap_resamples} réplications "
+        "sur les observations du test."
     )
+    for metric_name, label in (("f1", "F1 optimisé"), ("pr_auc", "PR-AUC")):
+        ci = optimized_bootstrap[metric_name]
+        print(
+            f"  {label}: {ci['point_estimate']:.4f} "
+            f"[IC95 {ci['ci_lower']:.4f} ; {ci['ci_upper']:.4f}]"
+        )
+    print(f"\n{deployment_description}")
+    print(f"Résumé JSON : {summary_path}")
+    print(f"Table seeds : {seed_csv}")
+    print(f"Annexe folds: {fold_csv}")
+    print(f"Audit Excel : {disagreement_excel}")
     print(
-        "  PR-AUC test          = "
-        f"{aggregates['test_pr_auc']['mean']:.4f} "
-        f"± {aggregates['test_pr_auc']['std']:.4f}"
+        "Désaccords forts : "
+        f"{len(strong_disagreements_dataframe)} lignes seed-note"
     )
-    print(
-        "  F1 test optimisé     = "
-        f"{aggregates['test_f1_optimized']['mean']:.4f} "
-        f"± {aggregates['test_f1_optimized']['std']:.4f}"
-    )
-
-    print_metrics_block(
-        "RÉSULTAT SECONDAIRE — ENSEMBLE DE TOUS LES MODÈLES @0.5",
-        all_models_metrics,
-    )
-    print(
-        "Désaccord moyen entre ensembles de seeds : "
-        f"{seed_disagreement:.4f}"
-    )
-    print(
-        "Attention : cet ensemble global est secondaire. Pour le benchmark, "
-        "reportez la moyenne ± écart-type entre les seeds d'entraînement."
-    )
-
-    print(f"\nDurée totale de l'évaluation : {format_duration(total_duration)}")
-    print(f"CSV multi-seeds : {results_csv}")
-    print(f"Résumé JSON     : {summary_path}")
-
     return summary
 
 
-# ---------------------------------------------------------------------
-# PROGRAMME PRINCIPAL
-# ---------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Évalue sur test les ensembles de folds des cinq seeds."
+        description=(
+            "Évalue les modèles individuels de fold et leur ensemble, puis "
+            "calcule des IC bootstrap sur le test."
+        )
     )
     parser.add_argument(
         "--seeds",
-        type=str,
-        default=",".join(str(seed) for seed in TRAINING_SEEDS),
-        help=(
-            "Seeds d'entraînement séparées par des virgules. Défaut : "
-            + ",".join(str(seed) for seed in TRAINING_SEEDS)
-        ),
+        default=",".join(map(str, TRAINING_SEEDS)),
+        help="Seeds d'entraînement séparées par des virgules.",
     )
+    parser.add_argument("--folds", type=int, default=K_FOLDS)
+    parser.add_argument("--bootstrap-resamples", type=int, default=2000)
+    parser.add_argument("--bootstrap-seed", type=int, default=2026)
     parser.add_argument(
-        "--folds",
-        type=int,
-        default=K_FOLDS,
-        help=f"Nombre de folds entraînés par seed. Défaut : {K_FOLDS}.",
+        "--deployment-strategy",
+        choices=["fold_ensemble", "single_model"],
+        default="fold_ensemble",
+        help=(
+            "Brique envisagée pour le déploiement. 'single_model' est signalé "
+            "comme un proxy tant qu'un modèle final n'est pas réentraîné."
+        ),
     )
     return parser
 
@@ -670,56 +773,57 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(args: argparse.Namespace) -> None:
     start = time.perf_counter()
     seeds = parse_seed_list(args.seeds)
-
     for path in (TRAIN_CV_CSV, TEST_CSV, MODEL_ROOT):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Fichier ou dossier introuvable : {path}")
 
-    _, test_ds = get_tokenized_datasets(TRAIN_CV_CSV, TEST_CSV)
+    test_metadata = pd.read_csv(TEST_CSV)
+    _, test_dataset = get_tokenized_datasets(TRAIN_CV_CSV, TEST_CSV)
 
-    print_banner("ÉVALUATION TEST — PROTOCOLE A STRICT")
-    print_key_values(
-        [
-            ("Modèle", MODEL_DISPLAY_NAME),
-            ("Identifiant Hugging Face", MODEL_NAME),
-            ("Dossier", MODEL_ROOT),
-            ("Seeds d'entraînement", ", ".join(map(str, seeds))),
-            ("Seed du split fixe", CV_SPLIT_SEED),
-            ("Folds par seed", args.folds),
-            ("Modèles chargés", len(seeds) * args.folds),
-            ("Test fixe", TEST_CSV),
-            ("Sélection des seuils", "uniquement sur les OOF de chaque seed"),
-        ]
-    )
+    if len(test_metadata) != len(test_dataset):
+        raise RuntimeError(
+            "Le nombre de lignes de test.csv ne correspond pas au dataset "
+            "tokenisé. Vérifiez qu'aucune ligne n'est filtrée par data_loader."
+        )
+
+    print_banner("ÉVALUATION TEST — PROTOCOLE GROUP-AWARE")
+    print_key_values([
+        ("Modèle", MODEL_DISPLAY_NAME),
+        ("Seeds", ", ".join(map(str, seeds))),
+        ("Folds par seed", args.folds),
+        ("Modèles individuels évalués", len(seeds) * args.folds),
+        ("Bootstrap", args.bootstrap_resamples),
+        ("Déploiement déclaré", args.deployment_strategy),
+    ])
 
     seed_results: List[Dict] = []
     seed_probabilities: List[np.ndarray] = []
-    reference_labels = None
-
-    for training_seed in seeds:
+    reference_labels: np.ndarray | None = None
+    for seed in seeds:
         result, probabilities, labels = evaluate_one_seed(
-            training_seed=training_seed,
+            training_seed=seed,
             fold_count=args.folds,
-            test_ds=test_ds,
+            test_dataset=test_dataset,
+            test_metadata=test_metadata,
         )
-
         if reference_labels is None:
             reference_labels = labels
         elif not np.array_equal(reference_labels, labels):
-            raise RuntimeError("Les labels du test diffèrent entre les seeds d'entraînement.")
-
+            raise RuntimeError("Les labels du test diffèrent entre les seeds.")
         seed_results.append(result)
         seed_probabilities.append(probabilities)
 
-    total_duration = time.perf_counter() - start
+    assert reference_labels is not None
     aggregate_results(
         seed_results=seed_results,
         seed_probabilities=seed_probabilities,
         test_labels=reference_labels,
-        total_duration=total_duration,
+        total_duration=time.perf_counter() - start,
+        bootstrap_resamples=args.bootstrap_resamples,
+        bootstrap_seed=args.bootstrap_seed,
+        deployment_strategy=args.deployment_strategy,
     )
 
 
 if __name__ == "__main__":
-    parser = build_arg_parser()
-    main(parser.parse_args())
+    main(build_arg_parser().parse_args())
